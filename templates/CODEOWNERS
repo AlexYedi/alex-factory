@@ -1,0 +1,20 @@
+# Copy to .github/CODEOWNERS and replace @YOUR_LOGIN.
+# Mirrors the tiers: the last matching line wins, and a pattern with no owner
+# means nobody's approval is required by CODEOWNERS.
+#
+# 1. Default: everything needs a code owner (matches the T2 default).
+*                 @YOUR_LOGIN
+
+# 2. T0 and T1 paths from factory-tiers.yml: unowned, so the App's approval counts.
+/docs/reference/
+/docs/evidence/
+/scripts/
+/src/
+/skills/
+
+# 3. T2 paths inside those folders go back to the owner. Keep these last.
+/scripts/lint_*.py   @YOUR_LOGIN
+/scripts/guard_*.py  @YOUR_LOGIN
+/.github/            @YOUR_LOGIN
+CLAUDE.md            @YOUR_LOGIN
+AGENTS.md            @YOUR_LOGIN

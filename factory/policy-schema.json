@@ -1,0 +1,45 @@
+{
+  "title": "factory-tiers policy",
+  "description": "Schema for .github/factory-tiers.yml. Anything not listed in a tier is T2.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "tests_command", "tiers"],
+  "properties": {
+    "version": {"type": "integer", "enum": [1]},
+    "tests_command": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Shell command factory-tests runs on the PR head. Use \"true\" for a repo with no tests."
+    },
+    "selftest_globs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Files factory-tests runs with the selftest marker when they contain it."
+    },
+    "selftest_marker": {"type": "string", "minLength": 1},
+    "tiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "t0": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "t1": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "t2": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "t2_new_file_globs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Paths that may be edited at a lower tier, but where a new file is T2."
+    },
+    "t2_if_diff_contains": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Literal strings that escalate to T2 when on a changed line, e.g. for skills touching gates."
+    },
+    "test_globs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "What counts as a test file for the deleted-test ratchet."
+    }
+  }
+}
