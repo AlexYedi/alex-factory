@@ -84,6 +84,14 @@ def scan(repo, local_sha, remote_sha):
         if any(t in text.casefold() for t in terms):
             findings.add((name_rule, where))
 
+    # git log peels a tag to its commit, so an annotated tag's message needs its own read.
+    sha = local_sha
+    while git(repo, "cat-file", "-t", sha).strip() == "tag":
+        body = git(repo, "cat-file", "tag", sha)
+        for line in body.split("\n"):
+            check_text(line, "(tag message)", "private name in tag message")
+        sha = body.split("\n", 1)[0].split()[1]
+
     names = git(repo, "log", "-m", "--no-renames", "--name-only", "--diff-filter=d",
                 "--format=", "-z", *span)
     for name in filter(None, names.replace("\n", "\0").split("\0")):
@@ -209,6 +217,17 @@ def selftest():
         base = tip
         tip = commit("g.txt", "key " + "\u200b".join(aws) + "\n")
         check("key split by zero-width chars is caught", any(r == "AWS access key" for r, _ in scan(repo, tip, base)))
+
+        base = git(repo, "rev-parse", "HEAD").strip()
+        run("tag", "-a", "v1", "-m", f"release {aws}")
+        tag = git(repo, "rev-parse", "refs/tags/v1").strip()
+        check("REVIEW2 annotated tag message is scanned", ("AWS access key", "(tag message)") in scan(repo, tag, base))
+        run("tag", "-a", "v1-outer", "-m", "wrapper", tag)
+        outer = git(repo, "rev-parse", "refs/tags/v1-outer").strip()
+        check("nested tag is scanned too", ("AWS access key", "(tag message)") in scan(repo, outer, base))
+        run("tag", "-a", "v2", "-m", "met Ja\u200bne Example", base)
+        names_tag = git(repo, "rev-parse", "refs/tags/v2").strip()
+        check("private term in a tag message is caught", ("private name in tag message", "(tag message)") in scan(repo, names_tag, base))
 
         def hook(sha):
             line = f"refs/heads/x {sha} refs/heads/x {ZERO}\n"

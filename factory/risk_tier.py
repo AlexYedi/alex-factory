@@ -29,8 +29,8 @@ TEST_GLOBS = ["tests/**", "**/tests/**", "**/test_*", "**/*_test.*", "**/*.test.
 SELFTEST_FLAG = re.compile(r"(?<![\w-])--selftest(?![\w-])")
 REGULAR_MODE = "100644"
 MODE_REASONS = {"120000": "symlink", "160000": "submodule"}
-# A T2 path here means GitHub itself demands a code owner, so the gate need not.
-OWNED_PATH_REASONS = ("guarded_path", "unmatched_path")
+PLACEHOLDER_OWNER = "YOUR_LOGIN"
+PLACEHOLDER_APP = "YOUR_APP_SLUG"
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 INDEX = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+(?: (\d{6}))?$")
@@ -286,7 +286,7 @@ def path_tier(path, policy):
 
 def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=None, enforce_blocklist=True):
     """Return the classification document. Tiers only ever move upward."""
-    tier, reasons, changes, owner_backstop = 0, [], [], False
+    tier, reasons, changes = 0, [], []
 
     def escalate(code, path=None, line=None):
         nonlocal tier
@@ -316,12 +316,11 @@ def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=Non
         for path in dict.fromkeys(p for p in (old, new) if p):
             path_level, reason = path_tier(path, policy)
             tier = max(tier, path_level)
-            owner_backstop = owner_backstop or reason in OWNED_PATH_REASONS
             if reason:
                 reasons.append({"code": reason, "path": path, "line": None})
             if any(t.search(fold(path)) for t in terms):
                 # No path or line: where a term sits is what would confirm it.
-                escalate("blocklist_match")
+                escalate("content_policy")
         shown = new or old
         for mode in sorted(change["modes"]):
             if mode != REGULAR_MODE:
@@ -342,7 +341,7 @@ def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=Non
             if kind == "+":
                 gained += selftest_hits(text)
                 if any(t.search(fold(text)) for t in terms):
-                    escalate("blocklist_match")
+                    escalate("content_policy")
             elif kind == "-":
                 lost += selftest_hits(text)
             if kind != " " and any(n in text for n in needles):
@@ -373,8 +372,48 @@ def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=Non
         if strip_report.get("too_large"):
             escalate("diff_too_large")
 
-    return {"tier": f"T{tier}", "reasons": reasons, "owner_backstop": owner_backstop,
+    return {"tier": f"T{tier}", "reasons": reasons,
             "paths": sorted({p for c in changes for p in (c["old"], c["new"]) if p})}
+
+
+def sticky_marker(digest):
+    return f"<!-- factory-gate-block diff={digest} -->"
+
+
+def sticky_block(reviews, app_login, digest):
+    """True if the App already blocked this diff. Only the App's reviews count, in
+    any state: a dismissal leaves the record behind.
+    """
+    if not (reviews and app_login and digest):
+        return False
+    marker = sticky_marker(digest)
+    return any((r.get("user") or {}).get("login") == app_login
+               and marker in (r.get("body") or "").split("\n") for r in reviews)
+
+
+def should_review(tier, strip_report, same_repo, draft, sticky):
+    """Whether to spend a model call. A sticky block needs none."""
+    return (tier != "T0" and same_repo and not draft and not sticky
+            and bool(strip_report) and bool(strip_report.get("prompt")))
+
+
+def adoption_errors(policy, codeowners, app_slug):
+    """Template placeholders left in place would mean nobody can clear T2."""
+    errors = []
+    if policy is None:
+        errors.append("factory-tiers.json is missing or invalid")
+    else:
+        if not policy["code_owners"]:
+            errors.append("code_owners is empty, so nobody can clear T2")
+        if PLACEHOLDER_OWNER in policy["code_owners"]:
+            errors.append(f"replace {PLACEHOLDER_OWNER} in code_owners in factory-tiers.json")
+    if codeowners is None:
+        errors.append(".github/CODEOWNERS is missing")
+    elif "@" + PLACEHOLDER_OWNER in codeowners:
+        errors.append(f"replace @{PLACEHOLDER_OWNER} in .github/CODEOWNERS")
+    if app_slug == PLACEHOLDER_APP:
+        errors.append(f"replace {PLACEHOLDER_APP} in the factory-gate caller workflow")
+    return errors
 
 
 def list_selftests(root, policy):
@@ -424,6 +463,11 @@ def main():
     parser.add_argument("--diff")
     parser.add_argument("--files")
     parser.add_argument("--strip-report")
+    parser.add_argument("--reviews")
+    parser.add_argument("--app-login", default="")
+    parser.add_argument("--check-adoption", action="store_true")
+    parser.add_argument("--codeowners")
+    parser.add_argument("--app-slug", default="")
     parser.add_argument("--same-repo", default="false")
     parser.add_argument("--draft", default="false")
     parser.add_argument("--plan", action="store_true",
@@ -435,6 +479,11 @@ def main():
         return selftest()
 
     policy, policy_error = load_policy(args.policy, args.schema) if args.policy else (None, "no policy")
+    if args.check_adoption:
+        errors = adoption_errors(policy, _read(args.codeowners), args.app_slug)
+        for error in errors:
+            print(f"::error::factory adoption: {error}")
+        return 1 if errors else 0
     if args.print_tests_command or args.list_selftests:
         if policy is None:
             print(f"policy unusable: {policy_error}", file=sys.stderr)
@@ -451,8 +500,7 @@ def main():
         doc = classify(_read(args.diff), policy, _flatten(_read_json(args.files)), blocklist,
                        strip_report, enforce_blocklist=not args.plan)
     except Exception as exc:  # fail closed: a classifier bug must not read as low risk
-        doc = {"tier": "T2", "reasons": [{"code": "classifier_error", "path": None, "line": None}],
-               "owner_backstop": False}
+        doc = {"tier": "T2", "reasons": [{"code": "classifier_error", "path": None, "line": None}]}
         print(f"classifier error: {type(exc).__name__}", file=sys.stderr)
     if policy is None:
         doc["reasons"].append({"code": "policy_invalid", "path": None, "line": None})
@@ -461,15 +509,16 @@ def main():
 
     same_repo = args.same_repo == "true"
     draft = args.draft == "true"
+    digest = (strip_report or {}).get("diff_hash")
+    sticky = sticky_block(_flatten(_read_json(args.reviews)), args.app_login, digest)
     if args.plan:
-        ready = bool(strip_report) and bool(strip_report.get("prompt"))
-        run_review = doc["tier"] != "T0" and same_repo and not draft and ready
+        run_review = should_review(doc["tier"], strip_report, same_repo, draft, sticky)
         with open(args.github_output, "a", encoding="utf-8") as handle:
             handle.write(f'run_review={"true" if run_review else "false"}\n')
         print(f"run_review={run_review}")
         return 0
 
-    doc.update(same_repo=same_repo, draft=draft, classified=True,
+    doc.update(same_repo=same_repo, draft=draft, classified=True, diff_hash=digest, sticky_block=sticky,
                owners=(policy or {}).get("code_owners", []))
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(doc, handle, indent=2)
@@ -573,12 +622,12 @@ def selftest():
     f += _case("selftest kept is fine", fx_mod("scripts/a.py", "x --selftest", "y --selftest"), "T1")
     f += _case("gate content marker", fx_mod("scripts/a.py", "GATE_MARKER = 1"), "T2", "gate_content")
     # hostile: blocklist
-    f += _case("blocklist in added line", fx_mod("docs/a.md", "met Jane Example today"), "T2", "blocklist_match", block="jane example")
-    f += _case("HOSTILE blocklist split by zero-width", fx_mod("docs/a.md", "met Ja​ne Example"), "T2", "blocklist_match", block="jane example")
-    f += _case("HOSTILE blocklist fullwidth", fx_mod("docs/a.md", "Ｊａne Example"), "T2", "blocklist_match", block="jane example")
-    f += _case("blocklist in path", fx_mod("docs/jane-example/a.md"), "T2", "blocklist_match", block="jane-example")
+    f += _case("blocklist in added line", fx_mod("docs/a.md", "met Jane Example today"), "T2", "content_policy", block="jane example")
+    f += _case("HOSTILE blocklist split by zero-width", fx_mod("docs/a.md", "met Ja​ne Example"), "T2", "content_policy", block="jane example")
+    f += _case("HOSTILE blocklist fullwidth", fx_mod("docs/a.md", "Ｊａne Example"), "T2", "content_policy", block="jane example")
+    f += _case("blocklist in path", fx_mod("docs/jane-example/a.md"), "T2", "content_policy", block="jane-example")
     doc = classify(fx_mod("docs/a.md", "met Jane Example"), POLICY, _api(fx_mod("docs/a.md")), "jane example", STRIP_OK)
-    hits = [r for r in doc["reasons"] if r["code"] == "blocklist_match"]
+    hits = [r for r in doc["reasons"] if r["code"] == "content_policy"]
     ok = len(hits) == 1 and hits[0]["path"] is None and hits[0]["line"] is None
     f += 0 if ok else 1
     print("ok  " if ok else "FAIL", "HOSTILE blocklist reason carries no path or line")
@@ -634,17 +683,46 @@ def selftest():
     f += 0 if ok else 1
     print("ok  " if ok else "FAIL", "REVIEW no patch-id cache to reuse a PASS")
 
-    # who backs a T2 decision: GitHub (owned path) or the gate (content-based)
-    owned = classify(fx_mod("migrations/1.sql"), POLICY, _api(fx_mod("migrations/1.sql")), "t", STRIP_OK)
-    unlisted = classify(fx_mod("src/a.py"), POLICY, _api(fx_mod("src/a.py")), "t", STRIP_OK)
-    ratchet = classify(fx_del("scripts/test_a.py"), POLICY, _api(fx_del("scripts/test_a.py")), "t", STRIP_OK)
-    new_file = classify(fx_new("content/b.md"), POLICY, _api(fx_new("content/b.md")), "t", STRIP_OK)
-    mixed_diff = fx_del("scripts/test_a.py") + fx_mod("migrations/1.sql")
-    mixed = classify(mixed_diff, POLICY, _api(mixed_diff), "t", STRIP_OK)
-    ok = owned["owner_backstop"] and unlisted["owner_backstop"] and mixed["owner_backstop"]
-    ok = ok and not ratchet["owner_backstop"] and not new_file["owner_backstop"]
+    # second review: guarded names that once slipped through as "owned"
+    f += _case("REVIEW2 nested workflow under src", fx_mod("src/.github/workflows/x.yml"), "T2", "guarded_path")
+    f += _case("REVIEW2 nested claude settings under src", fx_mod("src/.claude/settings.json"), "T2", "guarded_path")
+    f += _case("REVIEW2 env file under scripts", fx_mod("scripts/.env.local"), "T2", "guarded_path")
+    f += _case("REVIEW2 CLAUDE.MD in another case", fx_mod("src/CLAUDE.MD"), "T2", "guarded_path")
+
+    # sticky block: no model call, and only the App can vouch
+    digest = "d" * 64
+    marker = sticky_marker(digest)
+    sticky_cases = [([{"user": {"login": "app[bot]"}, "state": "COMMENTED", "body": f"x\n{marker}"}], True, "App block found"),
+                    ([{"user": {"login": "app[bot]"}, "state": "DISMISSED", "body": marker}], True, "REVIEW2 dismissal does not clear a block"),
+                    ([{"user": {"login": "someone"}, "body": marker}], False, "HOSTILE forged block by a user"),
+                    ([{"user": {"login": "app[bot]"}, "body": sticky_marker("e" * 64)}], False, "other diff is not blocked")]
+    for reviews, want, name in sticky_cases:
+        ok = sticky_block(reviews, "app[bot]", digest) == want
+        f += 0 if ok else 1
+        print("ok  " if ok else "FAIL", name)
+    ready = {"prompt": True}
+    ok = should_review("T1", ready, True, False, False) and not should_review("T1", ready, True, False, True)
     f += 0 if ok else 1
-    print("ok  " if ok else "FAIL", "owner backstop only where a path forces a code owner")
+    print("ok  " if ok else "FAIL", "REVIEW2 sticky block skips the model call")
+
+    # adoption must fail loudly on template placeholders
+    here = os.path.dirname(os.path.abspath(__file__))
+    owners_path = os.path.join(here, "..", "templates", "CODEOWNERS")
+    owners_text = _read(owners_path)
+    shipped, _ = load_policy(os.path.join(here, "..", "templates", "factory-tiers.json"), os.path.join(here, "policy-schema.json"))
+    errors = adoption_errors(shipped, owners_text, "YOUR_APP_SLUG")
+    ok = len(errors) == 3
+    f += 0 if ok else 1
+    print("ok  " if ok else "FAIL", "REVIEW2 unreplaced templates fail adoption", len(errors))
+    ready_policy = {**POLICY, "code_owners": ["someone"]}
+    ok = adoption_errors(ready_policy, "* @someone\n", "my-app") == []
+    ok = ok and adoption_errors(ready_policy, None, "my-app") and adoption_errors({**ready_policy, "code_owners": []}, "* @x", "a")
+    ok = bool(ok) and adoption_errors(None, "* @x", "a")
+    f += 0 if ok else 1
+    print("ok  " if ok else "FAIL", "adoption passes only when filled in")
+    missing = [g for g in HARD_T2 if g not in owners_text.replace("@YOUR_LOGIN", "")]
+    f += 0 if not missing else 1
+    print("ok  " if not missing else "FAIL", "REVIEW2 template CODEOWNERS covers every hard T2 glob", missing)
 
     # policy parsing, including the shipped template
     here = os.path.dirname(os.path.abspath(__file__))

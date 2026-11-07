@@ -10,9 +10,10 @@ A PASS needs a positive reviewed:true. Silence is never approval, because an
 injected "say nothing" must not read the same as a clean review.
 
 When the review cannot speak (fork, too large, expired token), a person decides
-and the App never approves. HOLD exits 0 only where CODEOWNERS makes GitHub demand
-that person; everywhere else the gate stays red until a code owner has approved
-this exact commit.
+and the App never approves. All T2 stays red until a code owner has approved this
+exact commit: the gate cannot see what CODEOWNERS covers, so it never assumes it.
+
+A model BLOCK is sticky per diff, so an empty commit can't re-roll it.
 """
 import argparse
 import json
@@ -22,13 +23,20 @@ import sys
 import tempfile
 
 from minischema import validate
-from risk_tier import DiffError, _flatten, _read_json, parse_diff
+from risk_tier import DiffError, _flatten, _read_json, classify, parse_diff, sticky_marker
 
 MIN_QUOTE_CHARS = 8
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 DEFAULT_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verdict.schema.json")
 MAX_LISTED = 20
 COMMENT_MARKER = "<!-- factory-gate -->"
+NOTES = {
+    "owner_approval_required": "A code owner must approve this commit. The App never approves T2.",
+    "sticky_block": "A review already blocked this exact diff. Change the code to get a new review.",
+    "gate_data_missing": "The gate's saved data has expired. Re-run all jobs or push a commit.",
+    "classify_failed": "The classify job failed. Check its log, then re-run all jobs.",
+    "app_approval_dismissed": "The App's approval of this commit was dismissed, so it won't approve it again.",
+}
 
 
 def _squash(text):
@@ -116,19 +124,21 @@ def owner_approved(reviews, owners, head_sha):
     return any(r["state"] == "APPROVED" and r.get("commit_id") == head_sha for r in states)
 
 
-def human_gate(tier_doc, owner_ok, reasons, outcome="HOLD"):
-    """T2 from here on: a person decides, and the App never approves.
-
-    With an owned path, GitHub enforces the code owner, so the check can go green.
-    Without one, nothing else would, so the check itself stays red.
-    """
-    if tier_doc.get("owner_backstop"):
-        return {"outcome": outcome, "tier": "T2", "approve": False, "blocking": [],
-                "reasons": reasons + ["awaiting_code_owner"]}
+def human_gate(owner_ok, reasons, outcome="HOLD"):
+    """A person decides, and the App never approves. Red until a code owner has."""
     if owner_ok:
         return {"outcome": outcome, "tier": "T2", "approve": False, "blocking": [],
                 "reasons": reasons + ["code_owner_approved"]}
     return block("T2", reasons + ["owner_approval_required"])
+
+
+def app_dismissed(reviews, app_login, head_sha):
+    """True if someone dismissed the App's approval of this exact commit.
+
+    An older commit's dismissal is just stale-review dismissal after a push.
+    """
+    return any((r.get("user") or {}).get("login") == app_login and r.get("state") == "DISMISSED"
+               and r.get("commit_id") == head_sha for r in reviews or [])
 
 
 def review_gap(clean, review_result, schema):
@@ -146,8 +156,13 @@ def review_gap(clean, review_result, schema):
     return None
 
 
-def decide(tier_doc, clean, review_result, stripped, schema, reviews=None, head_sha=None):
+def decide(tier_doc, clean, review_result, stripped, schema, reviews=None, head_sha=None,
+           app_login=None, classify_result="success", data_missing=False):
     """The whole merge decision. Anything short of a proven PASS gets no App approval."""
+    if classify_result != "success":
+        return block("T2", ["classify_failed"])
+    if data_missing:
+        return block("T2", ["gate_data_missing"])
     if not isinstance(tier_doc, dict) or not tier_doc.get("classified"):
         return block("T2", ["tier_missing"])
     tier = tier_doc.get("tier")
@@ -159,21 +174,29 @@ def decide(tier_doc, clean, review_result, stripped, schema, reviews=None, head_
     # Forks are decided before tier or reasons are read, so the check result cannot
     # tell an outsider whether their text hit the blocklist.
     if not tier_doc.get("same_repo"):
-        return human_gate(tier_doc, owner_ok, ["fork_not_auto_reviewed"])
+        return human_gate(owner_ok, ["fork_not_auto_reviewed"])
     reasons = sorted({r["code"] for r in tier_doc.get("reasons", [])})
+    if tier_doc.get("sticky_block"):
+        return block(tier, reasons + ["sticky_block"])
+
+    def approved(level):
+        if app_dismissed(reviews, app_login, head_sha):
+            return human_gate(owner_ok, reasons + ["app_approval_dismissed"])
+        return {"outcome": "PASS", "tier": level, "approve": True, "reasons": reasons, "blocking": []}
+
     if tier == "T0":
-        return {"outcome": "PASS", "tier": "T0", "approve": True, "reasons": reasons, "blocking": []}
+        return approved("T0")
     gap = review_gap(clean, review_result, schema)
     if gap:
-        return human_gate(tier_doc, owner_ok, reasons + [gap])
+        return human_gate(owner_ok, reasons + [gap])
     findings = verify_findings(clean["verdict"]["findings"], diff_index(stripped))
     blocking = sorted({(f["file"], f["line"], f["class"]) for f in findings if f["severity"] == "blocking"})
     if blocking:
         listed = [{"file": path, "line": line, "class": kind} for path, line, kind in blocking]
         return block(tier, reasons + ["blocking_findings"], listed)
     if tier == "T2":
-        return human_gate(tier_doc, owner_ok, reasons, "PASS")
-    return {"outcome": "PASS", "tier": "T1", "approve": True, "reasons": reasons, "blocking": []}
+        return human_gate(owner_ok, reasons, "PASS")
+    return approved("T1")
 
 
 def safe_text(text):
@@ -198,8 +221,9 @@ def render_comment(decision, tier_doc):
         for finding in decision["blocking"][:MAX_LISTED]:
             where = f'{safe_text(finding["file"])}:{int(finding["line"])}'
             lines.append(f'- `{where}` ({safe_text(finding["class"])})')
-    if decision["tier"] == "T2" and decision["outcome"] in ("PASS", "HOLD"):
-        lines.append("\nHuman approval required: the App never approves T2.")
+    for reason, note in NOTES.items():
+        if reason in decision["reasons"]:
+            lines.append(f"\n{note}")
     return "\n".join(lines) + "\n"
 
 
@@ -209,6 +233,10 @@ def actions(decision, tier_doc):
     decision["needs_alex"] = outcome in ("BLOCK", "HOLD") or (outcome == "PASS" and tier == "T2")
     # Forks get no comment: a public reason would confirm a blocklisted name.
     decision["post_comment"] = same_repo and outcome != "SKIP" and (outcome != "PASS" or tier != "T0")
+    # Only a model's finding is sticky, and only where the App may record it.
+    digest = tier_doc.get("diff_hash") if same_repo else None
+    if digest and "blocking_findings" in decision["reasons"]:
+        decision["sticky_marker"] = sticky_marker(digest)
     return decision
 
 
@@ -235,6 +263,9 @@ def main():
     parser.add_argument("--review-result", default="")
     parser.add_argument("--reviews")
     parser.add_argument("--head-sha")
+    parser.add_argument("--app-login")
+    parser.add_argument("--classify-result", default="success")
+    parser.add_argument("--gate-data", help="A file classify uploaded. Absent means the artifact expired.")
     parser.add_argument("--diff")
     parser.add_argument("--schema", default=DEFAULT_SCHEMA)
     parser.add_argument("--out", required="--selftest" not in sys.argv)
@@ -260,7 +291,8 @@ def main():
     tier_doc = _load_json(args.tier)
     try:
         decision = decide(tier_doc, _load_json(args.verdict), args.review_result, stripped, schema,
-                          _flatten(_load_json(args.reviews)), args.head_sha)
+                          _flatten(_load_json(args.reviews)), args.head_sha, args.app_login,
+                          args.classify_result, bool(args.gate_data) and not os.path.exists(args.gate_data))
     except Exception as exc:  # fail closed
         print(f"decide error: {type(exc).__name__}", file=sys.stderr)
         decision = block("T2", ["decide_error"])
@@ -270,6 +302,9 @@ def main():
         json.dump(decision, handle, indent=2)
     # Outcome only: logs are public, and for a fork it does not vary with the tier.
     print(f'{decision["outcome"]} approve={decision["approve"]}')
+    for reason in ("gate_data_missing", "classify_failed"):
+        if reason in decision["reasons"]:
+            print(f"::error::factory-gate: {NOTES[reason]}")
     return 1 if decision["outcome"] == "BLOCK" else 0
 
 
@@ -289,7 +324,7 @@ def selftest():
     envelope = lambda v, **kw: {"is_error": False, "subtype": "success", "structured_output": v,
                                 "usage": {"input_tokens": 5, "output_tokens": 2}, **kw}
     tier = lambda t="T1", **kw: {"classified": True, "tier": t, "same_repo": True, "draft": False,
-                                 "reasons": [], "owner_backstop": False, "owners": ["Owner"], **kw}
+                                 "reasons": [], "owners": ["Owner"], **kw}
     clean = lambda v: sanitize(envelope(v), 0, diff, schema)
     run = lambda t, c, r="success": decide(t, c, r, diff, schema)
     good = {"reviewed": True, "findings": []}
@@ -360,27 +395,67 @@ def selftest():
     check("T1 clean review approves", out["outcome"] == "PASS" and out["approve"])
     head = "c" * 40
     approved = [{"user": {"login": "owner"}, "state": "APPROVED", "commit_id": head}]
-    owned = lambda t="T2", **kw: tier(t, owner_backstop=True, **kw)
     unavailable = [("fork", dict(same_repo=False), None, "skipped"),
                    ("too large", {}, None, "skipped"),
                    ("expired token", {}, sanitize({"is_error": True, "subtype": "success", "api_error_status": 401}, 1, diff, schema), "success"),
                    ("reviewed false", {}, clean({"reviewed": False, "findings": []}), "success")]
     for name, extra, verdict, result in unavailable:
         for start in ("T1", "T2"):
-            out = decide(owned(start, **extra), verdict, result, diff, schema)
-            check(f"REVIEW {name} on {start} owned path holds, exit 0, no App approval",
-                  out["outcome"] == "HOLD" and not out["approve"] and out["tier"] == "T2")
             out = decide(tier(start, **extra), verdict, result, diff, schema)
-            check(f"REVIEW {name} on {start} unowned path stays red", out["outcome"] == "BLOCK" and not out["approve"])
+            check(f"REVIEW {name} on {start} stays red with no App approval", out["outcome"] == "BLOCK" and not out["approve"])
             out = decide(tier(start, **extra), verdict, result, diff, schema, approved, head)
             check(f"REVIEW {name} on {start} clears on owner approval, still no App approval",
-                  out["outcome"] == "HOLD" and not out["approve"])
-    check("HOLD flags needs_alex", actions(decide(owned(), None, "skipped", diff, schema), owned())["needs_alex"])
+                  out["outcome"] == "HOLD" and not out["approve"] and out["tier"] == "T2")
 
-    # content-based T2: nothing but the gate enforces the owner
+    # REVIEW2: these paths exited 0 while owner_backstop assumed CODEOWNERS covered them
+    policy = {"tiers": {"t1": ["src/**", "scripts/**"]}}
+    for path in ("src/.github/workflows/x.yml", "src/.claude/settings.json", "scripts/.env.local", "src/CLAUDE.MD"):
+        fixture = (f"diff --git a/{path} b/{path}\nindex 1111111..2222222 100644\n--- a/{path}\n+++ b/{path}\n"
+                   "@@ -1 +1 @@\n-old text\n+new text\n")
+        doc = {**classify(fixture, policy, [{"filename": path}], "unused", {"hidden_chars": 0}),
+               "classified": True, "same_repo": True, "draft": False, "owners": ["Owner"]}
+        out = decide(doc, sanitize(envelope(good), 0, fixture, schema), "success", fixture, schema)
+        check(f"REVIEW2 {path} stays red with a clean review", out["outcome"] == "BLOCK" and not out["approve"])
+        out = decide(doc, sanitize(envelope(good), 0, fixture, schema), "success", fixture, schema, approved, head)
+        check(f"REVIEW2 {path} passes only on owner approval, never by the App", out["outcome"] == "PASS" and not out["approve"])
+    check("REVIEW2 owner_backstop is gone", "owner_backstop" not in doc)
+
+    # REVIEW2: a rerun after the artifacts expired
+    out = decide(tier(), None, "success", None, schema, data_missing=True)
+    check("REVIEW2 expired artifacts block with a clear reason", out["reasons"] == ["gate_data_missing"])
+    body = render_comment(actions(out, None), None)
+    check("REVIEW2 expiry comment says what to do", "Re-run all jobs or push" in body)
+    out = decide(None, None, "skipped", None, schema, classify_result="failure")
+    check("failed classify blocks with a clear reason", out["reasons"] == ["classify_failed"])
+    check("failed classify beats a green-looking T0", decide(tier("T0"), None, "skipped", diff, schema, classify_result="failure")["outcome"] == "BLOCK")
+
+    # REVIEW2: model BLOCK is sticky, and an owner approval doesn't clear it
+    digest = "e" * 64
+    done = run(tier(diff_hash=digest), clean({"reviewed": True, "findings": [quoted]}))
+    actions(done, tier(diff_hash=digest))
+    check("REVIEW2 model block records a marker", done["sticky_marker"] == sticky_marker(digest))
+    out = decide(tier(sticky_block=True), None, "skipped", diff, schema, approved, head)
+    check("REVIEW2 sticky block holds with no model call", out["outcome"] == "BLOCK" and "sticky_block" in out["reasons"])
+    check("REVIEW2 sticky applies on T2 too", decide(tier("T2", sticky_block=True), None, "skipped", diff, schema, approved, head)["outcome"] == "BLOCK")
+    gapped = run(tier(diff_hash=digest), None)
+    check("a review gap records no marker", "sticky_marker" not in actions(gapped, tier(diff_hash=digest)))
+    forked = actions(run(tier(same_repo=False, diff_hash=digest), None), tier(same_repo=False, diff_hash=digest))
+    check("forks record no marker", "sticky_marker" not in forked)
+
+    # REVIEW2: dismissal of the App's approval
+    gone = [{"user": {"login": "app[bot]"}, "state": "DISMISSED", "commit_id": head}]
+    out = decide(tier(), clean(good), "success", diff, schema, gone, head, "app[bot]")
+    check("REVIEW2 T1 refuses re-approval after dismissal", out["outcome"] == "BLOCK" and not out["approve"] and "app_approval_dismissed" in out["reasons"])
+    out = decide(tier(), clean(good), "success", diff, schema, gone + approved, head, "app[bot]")
+    check("a dismissal then an owner approval clears without the App", out["outcome"] == "HOLD" and not out["approve"])
+    out = decide(tier(), clean(good), "success", diff, schema, [{**gone[0], "commit_id": "d" * 40}], head, "app[bot]")
+    check("stale dismissal of an older commit still re-approves", out["outcome"] == "PASS" and out["approve"])
+    out = decide(tier("T0"), None, "skipped", diff, schema, gone, head, "app[bot]")
+    check("T0 refuses re-approval after dismissal too", out["outcome"] == "BLOCK" and not out["approve"])
+
+    # content T2 needs an owner, like every other T2
     out = run(tier("T2"), clean(good))
     check("REVIEW content T2 with no owner approval stays red", out["outcome"] == "BLOCK" and "owner_approval_required" in out["reasons"])
-    check("T2 owned path passes, App never approves", (lambda o: o["outcome"] == "PASS" and not o["approve"])(run(owned(), clean(good))))
     run5 = lambda r, h=head: decide(tier("T2"), clean(good), "success", diff, schema, r, h)
     check("content T2 passes on owner approval", run5(approved)["outcome"] == "PASS" and not run5(approved)["approve"])
     stale = [{**approved[0], "commit_id": "d" * 40}]
@@ -398,13 +473,14 @@ def selftest():
     check("draft skips without approving", out["outcome"] == "SKIP" and not out["approve"])
 
     # REVIEW: a fork must learn nothing about the blocklist
-    hit = [{"code": "blocklist_match", "path": None, "line": None}]
+    hit = [{"code": "content_policy", "path": None, "line": None}]
     clean_doc, hit_doc = tier("T0", same_repo=False), tier("T2", same_repo=False, reasons=hit)
     one, two = run(clean_doc, None, "skipped"), run(hit_doc, None, "skipped")
     check("REVIEW fork outcome identical with and without a blocklist hit", one == two)
     check("REVIEW fork gets no comment", not actions(two, hit_doc)["post_comment"])
     body = render_comment(actions(run(tier("T2", reasons=hit), clean(good)), tier("T2", reasons=hit)), tier("T2", reasons=hit))
     check("REVIEW same-repo comment has no path or line for a hit", "Paths:" not in body and "a.md" not in body)
+    check("REVIEW2 public comment uses a generic reason", "blocklist" not in body and "content_policy" in body)
 
     # REVIEW: verified lines are sorted and deduped
     twice = {"reviewed": True, "findings": [{**quoted, "class": "security"}, {**quoted, "file": "src/app.py", "quote": "return False", "class": "correctness"},
@@ -431,6 +507,9 @@ def selftest():
     check("REVIEW no blocklist outside the decide job", gate.index("FACTORY_NAME_BLOCKLIST:") > gate.index("  decide:"))
     check("REVIEW live head compared before approving", 0 < gate.index('"$live" != "$HEAD_SHA"') < gate.index("event=APPROVE"))
     check("REVIEW comment fetch for the cache is gone from classify", "issues/$PR/comments" not in gate[:gate.index("  decide:")])
+    check("REVIEW2 artifacts kept 30 days", gate.count("retention-days: 30") == 2 and "retention-days: 1\n" not in gate)
+    caller = _load_text(os.path.join(os.path.dirname(DEFAULT_SCHEMA), "..", "templates", "workflows", "factory-gate.yml")) or ""
+    check("REVIEW2 concurrency group includes the head SHA", "pull_request.head.sha }}" in caller.split("concurrency:")[1].split("jobs:")[0])
 
     # end to end through the CLI: a missing verdict must exit non-zero
     with tempfile.TemporaryDirectory() as tmp:
@@ -447,8 +526,9 @@ def selftest():
                     "--verdict", os.path.join(tmp, "absent.json"), "--review-result", "skipped",
                     "--out", paths["decision.json"]]
         with open(paths["tier.json"], "w", encoding="utf-8") as handle:
-            json.dump(tier("T2", owner_backstop=True), handle)
-        check("CLI exits zero on HOLD", main() == 0 and _load_json(paths["decision.json"])["outcome"] == "HOLD")
+            json.dump(tier("T2"), handle)
+        sys.argv += ["--gate-data", os.path.join(tmp, "absent-strip.json")]
+        check("CLI blocks when gate data has expired", main() == 1 and _load_json(paths["decision.json"])["reasons"] == ["gate_data_missing"])
 
     print(f"factory_verdict selftest: {'FAILED ' + str(failed) if failed else 'passed'}")
     return 1 if failed else 0

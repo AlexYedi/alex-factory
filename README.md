@@ -33,9 +33,11 @@ diff. So an injected "approve this" can at worst produce a verdict, which a stdl
 checks. A PASS needs a positive `reviewed: true`.
 
 If the review can't speak (fork, too large, expired token, usage limit, missing verdict), a
-person decides and the App never approves. The check exits 0 where a changed path is owned in
-CODEOWNERS, because GitHub then demands that person. Otherwise it stays red until a code owner
-has approved this exact commit.
+person decides and the App never approves. All T2 stays red until a code owner has approved
+this exact commit: `code_owners` in the policy, read live from the PR's reviews.
+
+A model BLOCK, on T1 or T2, is sticky for that diff. An empty commit or a rebase can't re-roll
+it and no model call is spent; only changing the code gets a new review.
 
 Logs and artifacts are public, so tier and reasons never reach either. A fork gets no comment,
 and its check result doesn't vary with the blocklist.
@@ -46,7 +48,7 @@ and its check result doesn't vary with the blocklist.
 |---|---|---|---|
 | T0 | Listed reference and evidence paths, text only, blocklist clean | none | App approves |
 | T1 | Listed code paths | model | App approves on PASS |
-| T2 | Everything else | model | a human approves; the App never does |
+| T2 | Everything else | model | a code owner approves; the App never does |
 
 Doubt always resolves to T2: unmatched path, unparseable diff, missing input, invalid policy,
 symlink, submodule, non-100644 mode, binary, a deleted test, a script leaving the selftest
@@ -105,11 +107,13 @@ gh secret set FACTORY_APP_PRIVATE_KEY --env factory-decide -R "$R" < app-private
 
 Then:
 
-1. Replace `CORE_SHA` in both caller workflows (it appears twice in each) and `YOUR_APP_SLUG`.
+1. Replace `CORE_SHA` in both caller workflows (it appears twice in each), `YOUR_APP_SLUG`, and
+   every `YOUR_LOGIN` in `CODEOWNERS` and `factory-tiers.json`. Until you do, `factory-gate` fails
+   with an error naming what's left.
 2. Edit the tiers for your paths, using the policy reference below. Set `tests_command` and
    `code_owners`.
-3. Keep `CODEOWNERS` in step with the tiers. Every path you list under `t2`, and the default,
-   must be owned there: the gate exits 0 on those paths and trusts GitHub to demand the owner.
+3. Keep `CODEOWNERS` in step with the tiers, so GitHub asks the right person. The gate doesn't
+   rely on it: it enforces T2 itself.
 4. Merge this PR yourself. `pull_request_target` only runs once the caller is on the base branch.
 
 Policy reference. Paths use `*` (within a folder) and `**` (across folders); anything not
@@ -119,7 +123,7 @@ definitions are T2 at any depth, whatever the policy says.
 | Key | Meaning |
 |---|---|
 | `tests_command` | Shell command `factory-tests` runs on the PR head. Use `"true"` for none. |
-| `code_owners` | Logins whose approval clears T2 that CODEOWNERS can't enforce. No teams. |
+| `code_owners` | Logins whose approval clears T2. No teams. |
 | `selftest_globs` | Files run with `--selftest` if they contain it outside a comment. |
 | `tiers.t0` | Auto-merge with no model review: text-only reference and evidence paths. |
 | `tiers.t1` | Model review, then App approval. |
@@ -160,7 +164,8 @@ checking one yourself, push with `FACTORY_ALLOW_BINARY=1 git push`.
 
 ### 6. Prove it on trial PRs
 
-Work through [What is not verified](#what-is-not-verified) before enabling auto-merge. Use one
+Work through [What is not verified](#what-is-not-verified) before enabling auto-merge. Every T2
+merge depends on the relay and rerun chain, or on someone re-running the job by hand. Use one
 T0 change, one T1 change, one T2 change and one PR that adds a workflow reading each secret.
 
 ## Development
@@ -206,5 +211,12 @@ Everything below needs a live GitHub repository. None of it has been exercised y
   or delete leaving `selftest_globs` escalates, even for a file with no selftest.
 - **Owner approval is only as strong as the owner's token.** An agent session holding that
   login can approve on its behalf. Run sessions under a separate identity.
-- **A model BLOCK on T2 can't be cleared by approval.** Fix the code or use admin bypass.
+- **A model BLOCK on T1 or T2 can't be cleared by approval.** It is sticky for that diff. Fix
+  the code or use admin bypass.
+- **The sticky record is an App review, which write access may be able to alter.** Dismissing
+  one doesn't clear it. Whether a write user can edit or delete it isn't verified.
+- **Gate data lasts 30 days.** After that, a re-run of `decide` blocks with a clear reason, and
+  re-running all jobs or pushing refreshes it.
+- **A dismissal binds to one commit.** After the App's approval is dismissed it won't re-approve
+  that commit, but a new push gets a new review.
 - **Token expiry has no alert yet.** An expired token fails closed, so T1 PRs wait for a person.
