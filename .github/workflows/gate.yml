@@ -2,12 +2,16 @@
 # definition comes from the base branch. It NEVER checks out or executes PR code:
 # the diff arrives through the API as data, and policy is read from the base SHA.
 #
-# Three jobs, three environments, one credential each:
-#   classify  FACTORY_NAME_BLOCKLIST     (deterministic)
-#   review    CLAUDE_CODE_OAUTH_TOKEN    (model, no tools, no repo)
-#   decide    App id + key               (deterministic, the only writer)
-# Each environment must restrict deployment branches to main: that is what stops
+# Three jobs, one credential each at most:
+#   classify  none                                  (deterministic, public data only)
+#   review    CLAUDE_CODE_OAUTH_TOKEN               (model, no tools, no repo)
+#   decide    App id + key, FACTORY_NAME_BLOCKLIST  (deterministic, the only writer)
+# Both environments must restrict deployment branches to main: that is what stops
 # a same-repo PR reading these secrets from a workflow it adds itself.
+#
+# Logs and artifacts are public, including every env: block and ${{ }} value. So
+# classify hands over only data that is already public, and decide works out the
+# tier and reasons on its own disk. Only outcome and approve are ever printed.
 name: factory-gate
 on:
   workflow_call:
@@ -17,7 +21,7 @@ on:
         type: string
         required: true
       app_slug:
-        description: GitHub App slug. Only its comments can vouch for a prior pass.
+        description: GitHub App slug, used to find the gate's own sticky comment.
         type: string
         required: true
       core_repository:
@@ -32,7 +36,7 @@ on:
         default: 2.1.319
       policy_path:
         type: string
-        default: .github/factory-tiers.yml
+        default: .github/factory-tiers.json
       overlay_path:
         type: string
         default: .github/factory-overlay.md
@@ -43,13 +47,11 @@ jobs:
     name: classify
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: factory-classify
     permissions:
       contents: read
       pull-requests: read
     outputs:
-      tier: ${{ steps.tier.outputs.tier }}
-      run_review: ${{ steps.tier.outputs.run_review }}
+      run_review: ${{ steps.plan.outputs.run_review }}
     steps:
       - name: Check out factory core (never the PR)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,7 +60,7 @@ jobs:
           ref: ${{ inputs.core_sha }}
           path: _factory
           persist-credentials: false
-      - name: Fetch diff, file list, comments and base policy as data
+      - name: Fetch diff, file list and base policy as data
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -77,37 +79,44 @@ jobs:
             -H 'Accept: application/vnd.github.v3.diff' > "$out/raw.diff" || rm -f "$out/raw.diff"
           gh api --paginate --slurp "repos/$REPO/pulls/$PR/files?per_page=100" \
             > "$out/files.json" || rm -f "$out/files.json"
-          gh api --paginate --slurp "repos/$REPO/issues/$PR/comments?per_page=100" \
-            > "$out/comments.json" || rm -f "$out/comments.json"
           gh api "repos/$REPO/contents/$POLICY_PATH?ref=$BASE_SHA" \
-            -H 'Accept: application/vnd.github.raw+json' > "$out/policy.yml" || rm -f "$out/policy.yml"
-          gh api "repos/$REPO/contents/$OVERLAY_PATH?ref=$BASE_SHA" \
-            -H 'Accept: application/vnd.github.raw+json' > "$out/overlay.md" || : > "$out/overlay.md"
+            -H 'Accept: application/vnd.github.raw+json' > "$out/policy.json" || rm -f "$out/policy.json"
+          # No overlay is a valid setup. Failing to read one is not: reviewing without
+          # the repo's rules would quietly weaken the review.
+          if ! gh api "repos/$REPO/contents/$OVERLAY_PATH?ref=$BASE_SHA" \
+            -H 'Accept: application/vnd.github.raw+json' > "$out/overlay.md" 2> "$out/overlay.err"; then
+            if grep -q 'HTTP 404' "$out/overlay.err"; then
+              : > "$out/overlay.md"
+            else
+              echo "overlay fetch failed"
+              exit 1
+            fi
+          fi
       - name: Strip untrusted text
         run: |
           out="$RUNNER_TEMP/gate"
           python3 _factory/factory/strip_untrusted.py --diff "$out/raw.diff" \
             --contract _factory/factory/review-contract.md --overlay "$out/overlay.md" \
             --out-diff "$out/stripped.diff" --out-prompt "$out/prompt.txt" --report "$out/strip.json"
-      - name: Classify
-        id: tier
+      - name: Plan the review from public data
+        id: plan
         env:
-          FACTORY_NAME_BLOCKLIST: ${{ secrets.FACTORY_NAME_BLOCKLIST }}
           SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
           DRAFT: ${{ github.event.pull_request.draft }}
-          APP_LOGIN: ${{ inputs.app_slug }}[bot]
         run: |
           out="$RUNNER_TEMP/gate"
-          python3 _factory/factory/risk_tier.py --policy "$out/policy.yml" --diff "$out/raw.diff" \
-            --files "$out/files.json" --comments "$out/comments.json" --strip-report "$out/strip.json" \
-            --app-login "$APP_LOGIN" --same-repo "$SAME_REPO" --draft "$DRAFT" \
-            --out "$out/tier.json" --github-output "$GITHUB_OUTPUT"
-      - name: Hand classification to the next jobs
+          python3 _factory/factory/risk_tier.py --plan --policy "$out/policy.json" --diff "$out/raw.diff" \
+            --files "$out/files.json" --strip-report "$out/strip.json" \
+            --same-repo "$SAME_REPO" --draft "$DRAFT" --github-output "$GITHUB_OUTPUT"
+      - name: Hand the public data to the next jobs
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: gate-classify
+          name: gate-data
           path: |
-            ${{ runner.temp }}/gate/tier.json
+            ${{ runner.temp }}/gate/raw.diff
+            ${{ runner.temp }}/gate/files.json
+            ${{ runner.temp }}/gate/policy.json
+            ${{ runner.temp }}/gate/strip.json
             ${{ runner.temp }}/gate/stripped.diff
             ${{ runner.temp }}/gate/prompt.txt
           retention-days: 1
@@ -131,7 +140,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: gate-classify
+          name: gate-data
           path: ${{ runner.temp }}/gate
       - name: Install pinned Claude Code outside any repo
         env:
@@ -194,7 +203,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
-          name: gate-classify
+          name: gate-data
           path: ${{ runner.temp }}/gate
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: needs.review.result == 'success'
@@ -202,19 +211,6 @@ jobs:
         with:
           name: gate-review
           path: ${{ runner.temp }}/gate
-      - name: Decide
-        id: decide
-        env:
-          REVIEW_RESULT: ${{ needs.review.result }}
-        run: |
-          set -u
-          out="$RUNNER_TEMP/gate"
-          mkdir -p "$out"
-          rc=0
-          python3 _factory/factory/factory_verdict.py --decide --tier "$out/tier.json" \
-            --verdict "$out/verdict.clean.json" --diff "$out/stripped.diff" \
-            --review-result "$REVIEW_RESULT" --out "$out/decision.json" || rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
       - name: Mint App token
         id: app
         continue-on-error: true
@@ -223,6 +219,39 @@ jobs:
           app-id: ${{ secrets.FACTORY_APP_ID }}
           private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
+      - name: Read reviews live
+        if: steps.app.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # A failed read means no owner approval is seen, which fails closed.
+          out="$RUNNER_TEMP/gate"
+          mkdir -p "$out"
+          gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+            > "$out/reviews.json" || rm -f "$out/reviews.json"
+      - name: Decide
+        id: decide
+        env:
+          FACTORY_NAME_BLOCKLIST: ${{ secrets.FACTORY_NAME_BLOCKLIST }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -u
+          out="$RUNNER_TEMP/gate"
+          mkdir -p "$out"
+          python3 _factory/factory/risk_tier.py --policy "$out/policy.json" --diff "$out/raw.diff" \
+            --files "$out/files.json" --strip-report "$out/strip.json" \
+            --same-repo "$SAME_REPO" --draft "$DRAFT" --out "$out/tier.json"
+          rc=0
+          python3 _factory/factory/factory_verdict.py --decide --tier "$out/tier.json" \
+            --verdict "$out/verdict.clean.json" --diff "$out/stripped.diff" \
+            --review-result "$REVIEW_RESULT" --reviews "$out/reviews.json" --head-sha "$HEAD_SHA" \
+            --out "$out/decision.json" || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
       - name: Act on the decision
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -252,7 +281,7 @@ jobs:
             jq -r '.comment' "$out/decision.json" > "$out/comment.md"
             id="$(gh api --paginate --slurp "repos/$REPO/issues/$PR/comments?per_page=100" \
               | jq -r --arg login "$APP_LOGIN" 'add // [] | map(select(.user.login == $login
-                  and (.body | startswith("<!-- factory-gate ")))) | last | .id // empty')"
+                  and (.body | startswith("<!-- factory-gate -->")))) | last | .id // empty')"
             if [ -n "$id" ]; then
               gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@"$out/comment.md" > /dev/null || true
             else
@@ -265,6 +294,12 @@ jobs:
             gh api -X DELETE "repos/$REPO/issues/$PR/labels/needs-alex" > /dev/null 2>&1 || true
           fi
           if [ "$code" = 0 ] && [ "$approve" = true ] && [ "$tier" != T2 ]; then
+            # The review covered HEAD_SHA. A push since then is unreviewed code.
+            live="$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)" || exit 1
+            if [ "$live" != "$HEAD_SHA" ]; then
+              echo "head moved since review"
+              exit 1
+            fi
             gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f commit_id="$HEAD_SHA" \
               -f event=APPROVE -f body="Factory gate PASS (tier $tier)." > /dev/null || exit 1
           fi

@@ -4,10 +4,15 @@
 Two steps, both fail closed:
   --sanitize (review job) reduces the CLI envelope to schema-checked fields whose
     text is verified against the diff, so no model prose reaches an artifact.
-  --decide (decide job) re-verifies that and decides PASS, BLOCK or SKIP.
+  --decide (decide job) re-verifies that and decides PASS, HOLD, BLOCK or SKIP.
 
 A PASS needs a positive reviewed:true. Silence is never approval, because an
 injected "say nothing" must not read the same as a clean review.
+
+When the review cannot speak (fork, too large, expired token), a person decides
+and the App never approves. HOLD exits 0 only where CODEOWNERS makes GitHub demand
+that person; everywhere else the gate stays red until a code owner has approved
+this exact commit.
 """
 import argparse
 import json
@@ -17,12 +22,13 @@ import sys
 import tempfile
 
 from minischema import validate
-from risk_tier import DiffError, parse_diff
+from risk_tier import DiffError, _flatten, _read_json, parse_diff
 
 MIN_QUOTE_CHARS = 8
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 DEFAULT_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verdict.schema.json")
 MAX_LISTED = 20
+COMMENT_MARKER = "<!-- factory-gate -->"
 
 
 def _squash(text):
@@ -96,42 +102,78 @@ def block(tier, reasons, blocking=()):
             "blocking": list(blocking)}
 
 
-def decide(tier_doc, clean, review_result, stripped, schema):
-    """The whole merge decision. Every path that is not a proven PASS is a BLOCK."""
+def owner_approved(reviews, owners, head_sha):
+    """True if a code owner's latest review approves this exact commit."""
+    wanted = {owner.casefold() for owner in owners or []}
+    latest = {}
+    for review in reviews or []:
+        login = ((review.get("user") or {}).get("login") or "").casefold()
+        if login in wanted and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            latest[login] = review
+    states = list(latest.values())
+    if any(r["state"] == "CHANGES_REQUESTED" for r in states):
+        return False
+    return any(r["state"] == "APPROVED" and r.get("commit_id") == head_sha for r in states)
+
+
+def human_gate(tier_doc, owner_ok, reasons, outcome="HOLD"):
+    """T2 from here on: a person decides, and the App never approves.
+
+    With an owned path, GitHub enforces the code owner, so the check can go green.
+    Without one, nothing else would, so the check itself stays red.
+    """
+    if tier_doc.get("owner_backstop"):
+        return {"outcome": outcome, "tier": "T2", "approve": False, "blocking": [],
+                "reasons": reasons + ["awaiting_code_owner"]}
+    if owner_ok:
+        return {"outcome": outcome, "tier": "T2", "approve": False, "blocking": [],
+                "reasons": reasons + ["code_owner_approved"]}
+    return block("T2", reasons + ["owner_approval_required"])
+
+
+def review_gap(clean, review_result, schema):
+    """Why there is no usable review, or None if there is one."""
+    if review_result != "success":
+        return "review_did_not_run"
+    if not isinstance(clean, dict):
+        return "verdict_missing"
+    if clean.get("cli_ok") is not True:
+        return "review_cli_error"
+    if clean.get("malformed") or validate(clean.get("verdict"), schema):
+        return "verdict_malformed"
+    if clean["verdict"]["reviewed"] is not True:
+        return "not_reviewed"
+    return None
+
+
+def decide(tier_doc, clean, review_result, stripped, schema, reviews=None, head_sha=None):
+    """The whole merge decision. Anything short of a proven PASS gets no App approval."""
     if not isinstance(tier_doc, dict) or not tier_doc.get("classified"):
         return block("T2", ["tier_missing"])
     tier = tier_doc.get("tier")
     if tier not in ("T0", "T1", "T2"):
         return block("T2", ["tier_invalid"])
-    reasons = sorted({r["code"] for r in tier_doc.get("reasons", [])})
     if tier_doc.get("draft"):
         return {"outcome": "SKIP", "tier": tier, "approve": False, "reasons": ["draft"], "blocking": []}
+    owner_ok = owner_approved(reviews, tier_doc.get("owners"), head_sha)
+    # Forks are decided before tier or reasons are read, so the check result cannot
+    # tell an outsider whether their text hit the blocklist.
     if not tier_doc.get("same_repo"):
-        return block(tier, reasons + ["fork_not_auto_reviewed"])
-    # T2 is hard-coded out of approval here, as a backstop to the tier logic.
-    passed = {"outcome": "PASS", "tier": tier, "approve": tier in ("T0", "T1"),
-              "reasons": reasons, "blocking": []}
+        return human_gate(tier_doc, owner_ok, ["fork_not_auto_reviewed"])
+    reasons = sorted({r["code"] for r in tier_doc.get("reasons", [])})
     if tier == "T0":
-        return passed
-    if tier_doc.get("reuse_prior_pass"):
-        passed["reasons"] = reasons + ["identical_patch_already_reviewed"]
-        return passed
-    if review_result != "success":
-        return block(tier, reasons + ["review_did_not_run"])
-    if not isinstance(clean, dict):
-        return block(tier, reasons + ["verdict_missing"])
-    if clean.get("cli_ok") is not True:
-        return block(tier, reasons + ["review_cli_error"])
-    verdict = clean.get("verdict")
-    if clean.get("malformed") or validate(verdict, schema):
-        return block(tier, reasons + ["verdict_malformed"])
-    if verdict["reviewed"] is not True:
-        return block(tier, reasons + ["not_reviewed"])
-    findings = verify_findings(verdict["findings"], diff_index(stripped))
-    blocking = [f for f in findings if f["severity"] == "blocking"]
+        return {"outcome": "PASS", "tier": "T0", "approve": True, "reasons": reasons, "blocking": []}
+    gap = review_gap(clean, review_result, schema)
+    if gap:
+        return human_gate(tier_doc, owner_ok, reasons + [gap])
+    findings = verify_findings(clean["verdict"]["findings"], diff_index(stripped))
+    blocking = sorted({(f["file"], f["line"], f["class"]) for f in findings if f["severity"] == "blocking"})
     if blocking:
-        return block(tier, reasons + ["blocking_findings"], blocking)
-    return passed
+        listed = [{"file": path, "line": line, "class": kind} for path, line, kind in blocking]
+        return block(tier, reasons + ["blocking_findings"], listed)
+    if tier == "T2":
+        return human_gate(tier_doc, owner_ok, reasons, "PASS")
+    return {"outcome": "PASS", "tier": "T1", "approve": True, "reasons": reasons, "blocking": []}
 
 
 def safe_text(text):
@@ -142,44 +184,35 @@ def safe_text(text):
 def render_comment(decision, tier_doc):
     """Fixed template. No model prose can reach this: only enums, codes, path:line."""
     tier_doc = tier_doc if isinstance(tier_doc, dict) else {}
-    lines = []
-    fingerprint = tier_doc.get("fingerprint")
-    if fingerprint and re.fullmatch(r"[0-9a-f]{64}", fingerprint):
-        lines.append(f'<!-- factory-gate fingerprint={fingerprint} result={decision["outcome"]} -->')
-    else:
-        lines.append(f'<!-- factory-gate result={decision["outcome"]} -->')
-    lines.append(f'**Factory gate: {decision["outcome"]}** (tier {decision["tier"]})')
+    lines = [COMMENT_MARKER, f'**Factory gate: {decision["outcome"]}** (tier {decision["tier"]})']
     if decision["reasons"]:
         lines.append("\nReasons: " + ", ".join(f"`{safe_text(r)}`" for r in decision["reasons"]))
-    located = [r for r in tier_doc.get("reasons", []) if r.get("path")][:MAX_LISTED]
+    located = sorted({(r["path"], r.get("line") or 0, r["code"]) for r in tier_doc.get("reasons", []) if r.get("path")})
     if located:
         lines.append("\nPaths:")
-        for reason in located:
-            where = safe_text(reason["path"]) + (f':{int(reason["line"])}' if reason.get("line") else "")
-            lines.append(f'- `{where}` ({safe_text(reason["code"])})')
+        for path, line, code in located[:MAX_LISTED]:
+            where = safe_text(path) + (f":{int(line)}" if line else "")
+            lines.append(f"- `{where}` ({safe_text(code)})")
     if decision["blocking"]:
         lines.append("\nBlocking findings:")
         for finding in decision["blocking"][:MAX_LISTED]:
             where = f'{safe_text(finding["file"])}:{int(finding["line"])}'
             lines.append(f'- `{where}` ({safe_text(finding["class"])})')
-    if decision["tier"] == "T2" and decision["outcome"] == "PASS":
+    if decision["tier"] == "T2" and decision["outcome"] in ("PASS", "HOLD"):
         lines.append("\nHuman approval required: the App never approves T2.")
     return "\n".join(lines) + "\n"
 
 
-def actions(decision):
+def actions(decision, tier_doc):
     outcome, tier = decision["outcome"], decision["tier"]
-    decision["needs_alex"] = outcome == "BLOCK" or (outcome == "PASS" and tier == "T2")
-    decision["post_comment"] = outcome == "BLOCK" or (outcome == "PASS" and tier != "T0")
+    same_repo = isinstance(tier_doc, dict) and tier_doc.get("same_repo") is True
+    decision["needs_alex"] = outcome in ("BLOCK", "HOLD") or (outcome == "PASS" and tier == "T2")
+    # Forks get no comment: a public reason would confirm a blocklisted name.
+    decision["post_comment"] = same_repo and outcome != "SKIP" and (outcome != "PASS" or tier != "T0")
     return decision
 
 
-def _load_json(path):
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, ValueError, TypeError):
-        return None
+_load_json = _read_json
 
 
 def _load_text(path):
@@ -200,6 +233,8 @@ def main():
     parser.add_argument("--tier")
     parser.add_argument("--verdict")
     parser.add_argument("--review-result", default="")
+    parser.add_argument("--reviews")
+    parser.add_argument("--head-sha")
     parser.add_argument("--diff")
     parser.add_argument("--schema", default=DEFAULT_SCHEMA)
     parser.add_argument("--out", required="--selftest" not in sys.argv)
@@ -224,16 +259,17 @@ def main():
         parser.error("choose --sanitize or --decide")
     tier_doc = _load_json(args.tier)
     try:
-        decision = decide(tier_doc, _load_json(args.verdict), args.review_result, stripped, schema)
+        decision = decide(tier_doc, _load_json(args.verdict), args.review_result, stripped, schema,
+                          _flatten(_load_json(args.reviews)), args.head_sha)
     except Exception as exc:  # fail closed
         print(f"decide error: {type(exc).__name__}", file=sys.stderr)
         decision = block("T2", ["decide_error"])
-    actions(decision)
+    actions(decision, tier_doc)
     decision["comment"] = render_comment(decision, tier_doc)
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(decision, handle, indent=2)
-    print(f'{decision["outcome"]} tier={decision["tier"]} approve={decision["approve"]} '
-          f'reasons={decision["reasons"]}')
+    # Outcome only: logs are public, and for a fork it does not vary with the tier.
+    print(f'{decision["outcome"]} approve={decision["approve"]}')
     return 1 if decision["outcome"] == "BLOCK" else 0
 
 
@@ -253,7 +289,7 @@ def selftest():
     envelope = lambda v, **kw: {"is_error": False, "subtype": "success", "structured_output": v,
                                 "usage": {"input_tokens": 5, "output_tokens": 2}, **kw}
     tier = lambda t="T1", **kw: {"classified": True, "tier": t, "same_repo": True, "draft": False,
-                                 "reasons": [], "reuse_prior_pass": False, "fingerprint": "a" * 64, **kw}
+                                 "reasons": [], "owner_backstop": False, "owners": ["Owner"], **kw}
     clean = lambda v: sanitize(envelope(v), 0, diff, schema)
     run = lambda t, c, r="success": decide(t, c, r, diff, schema)
     good = {"reviewed": True, "findings": []}
@@ -273,6 +309,7 @@ def selftest():
     out = run(tier(), clean({"reviewed": True, "findings": [quoted]}))
     check("quoted blocking finding blocks", out["outcome"] == "BLOCK" and len(out["blocking"]) == 1)
     check("line number comes from the diff, not the model", out["blocking"][0]["line"] == 11)
+    check("no model text in the blocking list", set(out["blocking"][0]) == {"file", "line", "class"})
 
     # quote check edges
     for name, finding in [("too short", {**quoted, "quote": "}"}),
@@ -321,29 +358,79 @@ def selftest():
     check("T0 passes and approves with no model", out["outcome"] == "PASS" and out["approve"])
     out = run(tier(), clean(good))
     check("T1 clean review approves", out["outcome"] == "PASS" and out["approve"])
+    head = "c" * 40
+    approved = [{"user": {"login": "owner"}, "state": "APPROVED", "commit_id": head}]
+    owned = lambda t="T2", **kw: tier(t, owner_backstop=True, **kw)
+    unavailable = [("fork", dict(same_repo=False), None, "skipped"),
+                   ("too large", {}, None, "skipped"),
+                   ("expired token", {}, sanitize({"is_error": True, "subtype": "success", "api_error_status": 401}, 1, diff, schema), "success"),
+                   ("reviewed false", {}, clean({"reviewed": False, "findings": []}), "success")]
+    for name, extra, verdict, result in unavailable:
+        for start in ("T1", "T2"):
+            out = decide(owned(start, **extra), verdict, result, diff, schema)
+            check(f"REVIEW {name} on {start} owned path holds, exit 0, no App approval",
+                  out["outcome"] == "HOLD" and not out["approve"] and out["tier"] == "T2")
+            out = decide(tier(start, **extra), verdict, result, diff, schema)
+            check(f"REVIEW {name} on {start} unowned path stays red", out["outcome"] == "BLOCK" and not out["approve"])
+            out = decide(tier(start, **extra), verdict, result, diff, schema, approved, head)
+            check(f"REVIEW {name} on {start} clears on owner approval, still no App approval",
+                  out["outcome"] == "HOLD" and not out["approve"])
+    check("HOLD flags needs_alex", actions(decide(owned(), None, "skipped", diff, schema), owned())["needs_alex"])
+
+    # content-based T2: nothing but the gate enforces the owner
     out = run(tier("T2"), clean(good))
-    check("T2 clean review passes but App never approves", out["outcome"] == "PASS" and not out["approve"])
-    out = run(tier("T2", reuse_prior_pass=True), None, "skipped")
-    check("T2 reuse never approves", out["outcome"] == "PASS" and not out["approve"])
-    out = run(tier(reuse_prior_pass=True), None, "skipped")
-    check("identical patch reuses the prior pass", out["outcome"] == "PASS" and out["approve"])
+    check("REVIEW content T2 with no owner approval stays red", out["outcome"] == "BLOCK" and "owner_approval_required" in out["reasons"])
+    check("T2 owned path passes, App never approves", (lambda o: o["outcome"] == "PASS" and not o["approve"])(run(owned(), clean(good))))
+    run5 = lambda r, h=head: decide(tier("T2"), clean(good), "success", diff, schema, r, h)
+    check("content T2 passes on owner approval", run5(approved)["outcome"] == "PASS" and not run5(approved)["approve"])
+    stale = [{**approved[0], "commit_id": "d" * 40}]
+    check("REVIEW approval of an older commit does not count", run5(stale)["outcome"] == "BLOCK")
+    check("owner login is case-insensitive", owner_approved(approved, ["OWNER"], head))
+    check("non-owner approval does not count", run5([{**approved[0], "user": {"login": "someone"}}])["outcome"] == "BLOCK")
+    check("later dismissal cancels approval", run5(approved + [{"user": {"login": "owner"}, "state": "DISMISSED"}])["outcome"] == "BLOCK")
+    check("changes requested cancels approval", run5(approved + [{"user": {"login": "owner"}, "state": "CHANGES_REQUESTED"}])["outcome"] == "BLOCK")
+    check("a comment does not cancel approval", run5(approved + [{"user": {"login": "owner"}, "state": "COMMENTED"}])["outcome"] == "PASS")
+    check("no reviews stays red", run5(None)["outcome"] == "BLOCK")
+
     out = run(tier("T0", same_repo=False), None, "skipped")
     check("fork T0 is not auto-approved", out["outcome"] == "BLOCK" and not out["approve"])
-    out = run(tier(same_repo=False, reuse_prior_pass=True), None, "skipped")
-    check("fork cannot reuse a prior pass", out["outcome"] == "BLOCK")
     out = run(tier("T1", draft=True), None, "skipped")
     check("draft skips without approving", out["outcome"] == "SKIP" and not out["approve"])
 
+    # REVIEW: a fork must learn nothing about the blocklist
+    hit = [{"code": "blocklist_match", "path": None, "line": None}]
+    clean_doc, hit_doc = tier("T0", same_repo=False), tier("T2", same_repo=False, reasons=hit)
+    one, two = run(clean_doc, None, "skipped"), run(hit_doc, None, "skipped")
+    check("REVIEW fork outcome identical with and without a blocklist hit", one == two)
+    check("REVIEW fork gets no comment", not actions(two, hit_doc)["post_comment"])
+    body = render_comment(actions(run(tier("T2", reasons=hit), clean(good)), tier("T2", reasons=hit)), tier("T2", reasons=hit))
+    check("REVIEW same-repo comment has no path or line for a hit", "Paths:" not in body and "a.md" not in body)
+
+    # REVIEW: verified lines are sorted and deduped
+    twice = {"reviewed": True, "findings": [{**quoted, "class": "security"}, {**quoted, "file": "src/app.py", "quote": "return False", "class": "correctness"},
+                                            {**quoted, "class": "security"}]}
+    out = run(tier(), clean(twice))
+    check("REVIEW blocking lines deduped and sorted", [(b["line"], b["class"]) for b in out["blocking"]] == [(11, "correctness"), (11, "security")])
+
     # comments and follow-up actions
     tier_doc = tier("T1", reasons=[{"code": "x_code", "path": "src/`a`.py", "line": 3}])
-    out = actions(run(tier(), clean({"reviewed": True, "findings": [quoted]})))
+    out = actions(run(tier(), clean({"reviewed": True, "findings": [quoted]})), tier())
     body = render_comment(out, tier_doc)
-    check("comment has the fingerprint marker", body.split("\n")[0].startswith(f'<!-- factory-gate fingerprint={"a" * 64}'))
+    check("comment leads with the sticky marker", body.split("\n")[0] == COMMENT_MARKER)
     check("comment shows file:line and class only", "`src/app.py:11` (security)" in body and "allow everyone" not in body)
     check("BLOCK flags needs_alex", out["needs_alex"])
-    check("T2 PASS flags needs_alex", actions(run(tier("T2"), clean(good)))["needs_alex"])
-    check("T1 PASS does not flag needs_alex", not actions(run(tier(), clean(good)))["needs_alex"])
-    check("T0 PASS posts no comment", not actions(run(tier("T0"), None))["post_comment"])
+    check("T1 PASS does not flag needs_alex", not actions(run(tier(), clean(good)), tier())["needs_alex"])
+    check("T0 PASS posts no comment", not actions(run(tier("T0"), None), tier("T0"))["post_comment"])
+    check("unknown tier doc posts no comment", not actions(block("T2", ["tier_missing"]), None)["post_comment"])
+
+    # REVIEW: the workflow must not publish derived results or approve a moved head
+    gate_path = os.path.join(os.path.dirname(DEFAULT_SCHEMA), "..", ".github", "workflows", "gate.yml")
+    gate = _load_text(gate_path) or ""
+    artifact = gate[gate.index("name: gate-data"):gate.index("retention-days")]
+    check("REVIEW no derived result in a public artifact", "tier.json" not in artifact and "decision" not in artifact)
+    check("REVIEW no blocklist outside the decide job", gate.index("FACTORY_NAME_BLOCKLIST:") > gate.index("  decide:"))
+    check("REVIEW live head compared before approving", 0 < gate.index('"$live" != "$HEAD_SHA"') < gate.index("event=APPROVE"))
+    check("REVIEW comment fetch for the cache is gone from classify", "issues/$PR/comments" not in gate[:gate.index("  decide:")])
 
     # end to end through the CLI: a missing verdict must exit non-zero
     with tempfile.TemporaryDirectory() as tmp:
@@ -356,6 +443,12 @@ def selftest():
                     "--verdict", os.path.join(tmp, "absent.json"), "--review-result", "success",
                     "--out", paths["decision.json"]]
         check("CLI exits non-zero on BLOCK", main() == 1 and _load_json(paths["decision.json"])["outcome"] == "BLOCK")
+        sys.argv = ["factory_verdict.py", "--decide", "--tier", paths["tier.json"], "--diff", paths["diff"],
+                    "--verdict", os.path.join(tmp, "absent.json"), "--review-result", "skipped",
+                    "--out", paths["decision.json"]]
+        with open(paths["tier.json"], "w", encoding="utf-8") as handle:
+            json.dump(tier("T2", owner_backstop=True), handle)
+        check("CLI exits zero on HOLD", main() == 0 and _load_json(paths["decision.json"])["outcome"] == "HOLD")
 
     print(f"factory_verdict selftest: {'FAILED ' + str(failed) if failed else 'passed'}")
     return 1 if failed else 0

@@ -7,7 +7,6 @@ read from the base SHA. Every doubt resolves upward: unmatched path, parse
 failure, missing input and invalid policy all mean T2.
 """
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -18,17 +17,20 @@ import unicodedata
 from minischema import validate
 
 # A policy file can add to these but never remove them: they are the gate's own
-# controls, and a bad policy must not be able to downgrade them. Matched
-# case-insensitively, because macOS and Windows checkouts are case-insensitive.
+# controls, and a bad policy must not be able to downgrade them. These names act
+# at any depth, so every entry starts with **/. Matched case-insensitively,
+# because macOS and Windows checkouts are case-insensitive.
 HARD_T2 = [
-    ".github/**", "**/CODEOWNERS", "**/CLAUDE.md", "**/AGENTS.md", ".claude/hooks/**",
-    ".claude/settings*.json", ".claude/agents/**", ".gitignore", ".gitleaksignore",
-    ".gitattributes", "**/.env*", "**/.mcp.json", ".husky/**", ".githooks/**",
+    "**/.github/**", "**/CODEOWNERS", "**/CLAUDE.md", "**/AGENTS.md", "**/.claude/hooks/**",
+    "**/.claude/settings*.json", "**/.claude/agents/**", "**/.gitignore", "**/.gitleaksignore",
+    "**/.gitattributes", "**/.env*", "**/.mcp.json", "**/.husky/**", "**/.githooks/**",
 ]
-DEFAULT_TEST_GLOBS = ["tests/**", "**/tests/**", "**/test_*", "**/*_test.*", "**/*.test.*"]
-DEFAULT_SELFTEST_MARKER = "--selftest"
+TEST_GLOBS = ["tests/**", "**/tests/**", "**/test_*", "**/*_test.*", "**/*.test.*"]
+SELFTEST_FLAG = re.compile(r"(?<![\w-])--selftest(?![\w-])")
 REGULAR_MODE = "100644"
 MODE_REASONS = {"120000": "symlink", "160000": "submodule"}
+# A T2 path here means GitHub itself demands a code owner, so the gate need not.
+OWNED_PATH_REASONS = ("guarded_path", "unmatched_path")
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 INDEX = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+(?: (\d{6}))?$")
@@ -129,7 +131,7 @@ def parse_diff(text):
             raise DiffError(f"expected file header at line {i + 1}")
         old, new = _header_paths(lines[i][len("diff --git "):])
         change = {"old": old, "new": new, "status": "modified", "modes": set(), "binary": False,
-                  "lines": [], "index": ""}
+                  "lines": []}
         i += 1
         while i < total and not lines[i].startswith(("diff --git ", "@@ ")):
             line = lines[i]
@@ -148,7 +150,6 @@ def parse_diff(text):
                 found = INDEX.match(line)
                 if not found:
                     raise DiffError("bad index line")
-                change["index"] = line
                 if found.group(1):
                     change["modes"].add(found.group(1))
             elif line.startswith(("similarity index ", "dissimilarity index ")):
@@ -208,91 +209,20 @@ def parse_diff(text):
     return changes
 
 
-def patch_id(changes):
-    """Identity of the patch, stable across rebases (ignores line numbers)."""
-    digest = hashlib.sha256()
-    for change in sorted(changes, key=lambda c: (c["old"] or "", c["new"] or "")):
-        head = [change["old"], change["new"], change["status"], sorted(change["modes"])]
-        digest.update(json.dumps(head).encode())
-        if change["binary"]:
-            digest.update(change["index"].encode())
-        for kind, _, _, text in change["lines"]:
-            digest.update(f"{kind}{text}\n".encode("utf-8", "surrogatepass"))
-    return digest.hexdigest()
-
-
 # --- policy ------------------------------------------------------------------
 
-def _yaml_scalar(text):
-    if text == "[]":
-        return []
-    if text[:1] == '"':
-        return json.loads(text)
-    if text[:1] == "'" and text[-1:] == "'" and len(text) > 1:
-        return text[1:-1].replace("''", "'")
-    if not text or text[0] in "[{&*!|>%@`":
-        raise ValueError("unsupported YAML scalar")
-    return int(text) if text.isdigit() else text
-
-
-def _yaml_uncomment(line):
-    quote = None
-    for i, char in enumerate(line):
-        if quote:
-            quote = None if char == quote else quote
-        elif char in "\"'":
-            quote = char
-        elif char == "#" and (i == 0 or line[i - 1] in " \t"):
-            return line[:i]
-    return line
-
-
-def _yaml_block(rows, i, indent):
-    if rows[i][1].startswith("- "):
-        items = []
-        while i < len(rows) and rows[i][0] == indent and rows[i][1].startswith("- "):
-            items.append(_yaml_scalar(rows[i][1][2:].strip()))
-            i += 1
-        return items, i
-    mapping = {}
-    while i < len(rows) and rows[i][0] == indent:
-        key, sep, value = rows[i][1].partition(":")
-        if not sep or (value and not value.startswith(" ")) or key in mapping:
-            raise ValueError("bad or duplicate mapping key")
-        i += 1
-        if value.strip():
-            mapping[key] = _yaml_scalar(value.strip())
-        elif i < len(rows) and rows[i][0] > indent:
-            mapping[key], i = _yaml_block(rows, i, rows[i][0])
-        else:
-            mapping[key] = None
-    return mapping, i
-
-
-def parse_policy_yaml(text):
-    """Parse the block-style YAML subset the policy uses, and refuse the rest."""
-    rows = []
-    for raw in text.split("\n"):
-        line = _yaml_uncomment(raw).rstrip()
-        if not line.strip():
-            continue
-        body = line.lstrip(" ")
-        if body.startswith("\t") or "\t" in line[:len(line) - len(body)]:
-            raise ValueError("tabs are not valid YAML indentation")
-        rows.append((len(line) - len(body), body))
-    if not rows:
-        raise ValueError("empty policy")
-    root, end = _yaml_block(rows, 0, rows[0][0])
-    if end != len(rows):
-        raise ValueError("inconsistent indentation")
-    return root
+def _refuse_duplicates(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate key")
+    return dict(pairs)
 
 
 def load_policy(path, schema_path):
     """Return (policy, error). Any failure returns None: everything becomes T2."""
     try:
         with open(path, encoding="utf-8") as handle:
-            policy = parse_policy_yaml(handle.read())
+            policy = json.load(handle, object_pairs_hook=_refuse_duplicates)
         with open(schema_path, encoding="utf-8") as handle:
             errors = validate(policy, json.load(handle))
     except (OSError, ValueError, TypeError) as exc:
@@ -312,6 +242,23 @@ def fold(text):
 def blocklist_terms(raw):
     terms = [fold(t.strip()) for t in (raw or "").split("\n")]
     return [re.compile(rf"(?<!\w){re.escape(t)}(?!\w)") for t in terms if t]
+
+
+def code_part(line):
+    """The line up to its comment: a marker in a comment proves nothing."""
+    quote = None
+    for i, char in enumerate(line):
+        if quote:
+            quote = None if char == quote else quote
+        elif char in "\"'":
+            quote = char
+        elif char == "#" or line.startswith("//", i):
+            return line[:i]
+    return line
+
+
+def selftest_hits(line):
+    return len(SELFTEST_FLAG.findall(code_part(line)))
 
 
 def _bad_path(path):
@@ -337,14 +284,16 @@ def path_tier(path, policy):
     return 2, "unmatched_path"
 
 
-def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=None):
+def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=None, enforce_blocklist=True):
     """Return the classification document. Tiers only ever move upward."""
-    tier, reasons, changes = 0, [], []
+    tier, reasons, changes, owner_backstop = 0, [], [], False
 
     def escalate(code, path=None, line=None):
         nonlocal tier
         tier = 2
-        reasons.append({"code": code, "path": path, "line": line})
+        reason = {"code": code, "path": path, "line": line}
+        if reason not in reasons:
+            reasons.append(reason)
 
     if diff_text is None:
         escalate("diff_unavailable")
@@ -357,22 +306,22 @@ def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=Non
         escalate("empty_diff")
 
     policy_view = policy or {}
-    test_globs = policy_view.get("test_globs", DEFAULT_TEST_GLOBS)
     new_globs = policy_view.get("t2_new_file_globs", [])
     needles = policy_view.get("t2_if_diff_contains", [])
-    marker = policy_view.get("selftest_marker", DEFAULT_SELFTEST_MARKER)
+    selftest_globs = policy_view.get("selftest_globs", [])
     terms = blocklist_terms(blocklist)
-    removed_selftests = added_selftests = 0
 
     for change in changes:
         old, new = change["old"], change["new"]
         for path in dict.fromkeys(p for p in (old, new) if p):
             path_level, reason = path_tier(path, policy)
             tier = max(tier, path_level)
+            owner_backstop = owner_backstop or reason in OWNED_PATH_REASONS
             if reason:
                 reasons.append({"code": reason, "path": path, "line": None})
             if any(t.search(fold(path)) for t in terms):
-                escalate("blocklist_match", path)
+                # No path or line: where a term sits is what would confirm it.
+                escalate("blocklist_match")
         shown = new or old
         for mode in sorted(change["modes"]):
             if mode != REGULAR_MODE:
@@ -381,21 +330,26 @@ def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=Non
             escalate("binary_file", shown)
         if change["status"] in ("added", "renamed", "copied") and new and matches(new, new_globs):
             escalate("new_content_file", new)
-        if old and matches(old, test_globs) and change["status"] != "copied":
-            if change["status"] == "deleted" or (new and not matches(new, test_globs)):
-                escalate("deleted_test", old)
+        gone = change["status"] == "deleted" or change["status"] == "renamed"
+        if old and gone and matches(old, TEST_GLOBS) and not (new and matches(new, TEST_GLOBS)):
+            escalate("deleted_test", old)
+        # A pure rename has no hunks to count, so leaving the selftest list is the
+        # signal. The gate has no tree, so the list is compared by glob membership.
+        if old and gone and matches(old, selftest_globs) and not (new and matches(new, selftest_globs)):
+            escalate("selftest_script_left", old)
+        lost = gained = 0
         for kind, _, new_no, text in change["lines"]:
             if kind == "+":
-                added_selftests += text.count(marker)
+                gained += selftest_hits(text)
                 if any(t.search(fold(text)) for t in terms):
-                    escalate("blocklist_match", shown, new_no)
+                    escalate("blocklist_match")
             elif kind == "-":
-                removed_selftests += text.count(marker)
+                lost += selftest_hits(text)
             if kind != " " and any(n in text for n in needles):
                 escalate("gate_content", shown, new_no)
-
-    if removed_selftests > added_selftests:
-        escalate("selftest_count_lowered")
+        # Per file: a marker moved to another file must not cancel out here.
+        if lost > gained:
+            escalate("selftest_count_lowered", shown)
 
     if api_files is None:
         escalate("file_list_unavailable")
@@ -408,7 +362,7 @@ def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=Non
             escalate("file_list_mismatch")
 
     # An unset secret must not quietly remove the only check on T0's private text.
-    if tier == 0 and not terms:
+    if enforce_blocklist and tier == 0 and not terms:
         escalate("blocklist_unconfigured")
 
     if strip_report is None:
@@ -416,33 +370,14 @@ def classify(diff_text, policy, api_files=None, blocklist=None, strip_report=Non
     else:
         if strip_report.get("hidden_chars"):
             escalate("hidden_characters")
-        if strip_report.get("injection_markers"):
-            escalate("injection_marker")
         if strip_report.get("too_large"):
             escalate("diff_too_large")
 
-    return {"tier": f"T{tier}", "reasons": reasons, "patch_id": patch_id(changes) if changes else None,
+    return {"tier": f"T{tier}", "reasons": reasons, "owner_backstop": owner_backstop,
             "paths": sorted({p for c in changes for p in (c["old"], c["new"]) if p})}
 
 
-def prior_pass(comments, app_login, fingerprint):
-    """True if this bot already passed this exact patch and review context.
-
-    Only the App's own comments count: anyone can type the marker, nobody else
-    can post as the App.
-    """
-    if not (comments and app_login and fingerprint):
-        return False
-    marker = f"<!-- factory-gate fingerprint={fingerprint} result=PASS -->"
-    for comment in comments:
-        if (comment.get("user") or {}).get("login") == app_login:
-            if marker in (comment.get("body") or "").split("\n"):
-                return True
-    return False
-
-
 def list_selftests(root, policy):
-    marker = policy.get("selftest_marker", DEFAULT_SELFTEST_MARKER)
     found = []
     for folder, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if d not in (".git", "node_modules", ".venv")]
@@ -452,7 +387,7 @@ def list_selftests(root, policy):
             if os.path.islink(full) or not matches(rel, policy.get("selftest_globs", [])):
                 continue
             with open(full, encoding="utf-8", errors="replace") as handle:
-                if marker in handle.read():
+                if any(selftest_hits(line) for line in handle.read().split("\n")):
                     found.append(rel)
     return sorted(found)
 
@@ -489,10 +424,10 @@ def main():
     parser.add_argument("--diff")
     parser.add_argument("--files")
     parser.add_argument("--strip-report")
-    parser.add_argument("--comments")
-    parser.add_argument("--app-login", default="")
     parser.add_argument("--same-repo", default="false")
     parser.add_argument("--draft", default="false")
+    parser.add_argument("--plan", action="store_true",
+                        help="Classify from public data only, to decide whether to run the review.")
     parser.add_argument("--out")
     parser.add_argument("--github-output")
     args = parser.parse_args()
@@ -511,44 +446,42 @@ def main():
         return 0
 
     strip_report = _read_json(args.strip_report)
+    blocklist = None if args.plan else os.environ.get("FACTORY_NAME_BLOCKLIST")
     try:
-        doc = classify(_read(args.diff), policy, _flatten(_read_json(args.files)),
-                       os.environ.get("FACTORY_NAME_BLOCKLIST"), strip_report)
+        doc = classify(_read(args.diff), policy, _flatten(_read_json(args.files)), blocklist,
+                       strip_report, enforce_blocklist=not args.plan)
     except Exception as exc:  # fail closed: a classifier bug must not read as low risk
         doc = {"tier": "T2", "reasons": [{"code": "classifier_error", "path": None, "line": None}],
-               "patch_id": None, "paths": []}
+               "owner_backstop": False}
         print(f"classifier error: {type(exc).__name__}", file=sys.stderr)
     if policy is None:
         doc["reasons"].append({"code": "policy_invalid", "path": None, "line": None})
         print(f"policy unusable: {policy_error}", file=sys.stderr)
+    doc.pop("paths", None)
 
     same_repo = args.same_repo == "true"
     draft = args.draft == "true"
-    context = (strip_report or {}).get("context_hash")
-    fingerprint = None
-    if doc["patch_id"] and context:
-        fingerprint = hashlib.sha256(f'{doc["patch_id"]}:{context}'.encode()).hexdigest()
-    reuse = doc["tier"] != "T0" and prior_pass(_flatten(_read_json(args.comments)), args.app_login, fingerprint)
-    prompt_ready = bool(strip_report) and not strip_report.get("too_large") and bool(strip_report.get("prompt"))
-    run_review = doc["tier"] != "T0" and same_repo and not draft and not reuse and prompt_ready
-    doc.update(same_repo=same_repo, draft=draft, fingerprint=fingerprint, reuse_prior_pass=reuse,
-               run_review=run_review, classified=True)
-
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as handle:
-            json.dump(doc, handle, indent=2)
-    if args.github_output:
+    if args.plan:
+        ready = bool(strip_report) and bool(strip_report.get("prompt"))
+        run_review = doc["tier"] != "T0" and same_repo and not draft and ready
         with open(args.github_output, "a", encoding="utf-8") as handle:
-            handle.write(f'tier={doc["tier"]}\nrun_review={"true" if run_review else "false"}\n')
-    codes = sorted({r["code"] for r in doc["reasons"]})
-    print(f'tier={doc["tier"]} files={len(doc["paths"])} reasons={codes} run_review={run_review}')
+            handle.write(f'run_review={"true" if run_review else "false"}\n')
+        print(f"run_review={run_review}")
+        return 0
+
+    doc.update(same_repo=same_repo, draft=draft, classified=True,
+               owners=(policy or {}).get("code_owners", []))
+    with open(args.out, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle, indent=2)
+    # Workflow logs are public, and a fork could read a tier change as a blocklist hit.
+    print("classified")
     return 0
 
 
 # --- selftest ----------------------------------------------------------------
 
 POLICY = {
-    "version": 1, "tests_command": "true", "selftest_globs": ["scripts/*.py"],
+    "version": 1, "tests_command": "true", "code_owners": ["owner"], "selftest_globs": ["scripts/*.py"],
     "tiers": {"t0": ["docs/**", "content/**"], "t1": ["scripts/**"],
               "t2": ["scripts/guard_*.py", "migrations/**"]},
     "t2_new_file_globs": ["content/**"], "t2_if_diff_contains": ["GATE_MARKER"],
@@ -644,6 +577,11 @@ def selftest():
     f += _case("HOSTILE blocklist split by zero-width", fx_mod("docs/a.md", "met Ja​ne Example"), "T2", "blocklist_match", block="jane example")
     f += _case("HOSTILE blocklist fullwidth", fx_mod("docs/a.md", "Ｊａne Example"), "T2", "blocklist_match", block="jane example")
     f += _case("blocklist in path", fx_mod("docs/jane-example/a.md"), "T2", "blocklist_match", block="jane-example")
+    doc = classify(fx_mod("docs/a.md", "met Jane Example"), POLICY, _api(fx_mod("docs/a.md")), "jane example", STRIP_OK)
+    hits = [r for r in doc["reasons"] if r["code"] == "blocklist_match"]
+    ok = len(hits) == 1 and hits[0]["path"] is None and hits[0]["line"] is None
+    f += 0 if ok else 1
+    print("ok  " if ok else "FAIL", "HOSTILE blocklist reason carries no path or line")
     f += _case("blocklist only on whole words", fx_mod("docs/a.md", "planet"), "T0", block="plane")
     # fail closed
     f += _case("HOSTILE unset blocklist removes T0", fx_mod("docs/a.md"), "T2", "blocklist_unconfigured", block=None)
@@ -658,7 +596,7 @@ def selftest():
     f += _case("file list mismatch", fx_mod("docs/a.md"), "T2", "file_list_mismatch", files=[{"filename": "docs/z.md"}])
     f += _case("missing strip report", fx_mod("docs/a.md"), "T2", "strip_report_missing", strip=None)
     f += _case("hidden characters", fx_mod("docs/a.md"), "T2", "hidden_characters", strip={"hidden_chars": 2})
-    f += _case("injection marker", fx_mod("scripts/a.py"), "T2", "injection_marker", strip={"injection_markers": 1})
+    f += _case("agent repo text is no longer a false T2", fx_mod("scripts/a.py", "system prompt builder"), "T1")
     f += _case("too large", fx_mod("docs/a.md"), "T2", "diff_too_large", strip={"too_large": True})
 
     # globs
@@ -670,31 +608,50 @@ def selftest():
         f += 0 if ok else 1
         print("ok  " if ok else "FAIL", "glob", pattern, path)
 
-    # patch id
-    one = parse_diff(fx_mod("docs/a.md"))
-    moved = parse_diff(fx_mod("docs/a.md").replace("@@ -1 +1 @@", "@@ -40 +40 @@"))
-    other = parse_diff(fx_mod("docs/a.md", "different"))
-    ok = patch_id(one) == patch_id(moved) and patch_id(one) != patch_id(other)
-    f += 0 if ok else 1
-    print("ok  " if ok else "FAIL", "patch id ignores position, not content")
+    # reviewer inputs: guarded names at any depth, any case
+    f += _case("REVIEW nested claude settings", fx_mod("docs/reference/.claude/settings.json"), "T2", "guarded_path")
+    f += _case("REVIEW nested gitattributes", fx_mod("docs/.gitattributes"), "T2", "guarded_path")
+    f += _case("REVIEW nested gitattributes, other case", fx_mod("docs/.GITATTRIBUTES"), "T2", "guarded_path")
+    f += _case("nested github dir", fx_mod("docs/.github/x.yml"), "T2", "guarded_path")
+    f += _case("nested gitignore", fx_mod("scripts/.gitignore"), "T2", "guarded_path")
 
-    # reuse must only trust the App's own comments
-    marker = "<!-- factory-gate fingerprint=abc result=PASS -->"
-    reuse_cases = [([{"user": {"login": "app[bot]"}, "body": f"x\n{marker}\ny"}], True, "App marker reused"),
-                   ([{"user": {"login": "attacker"}, "body": marker}], False, "HOSTILE forged marker by a user"),
-                   ([{"user": {"login": "app[bot]"}, "body": "quoted: " + marker}], False, "marker must be its own line"),
-                   ([{"user": {"login": "app[bot]"}, "body": marker.replace("abc", "zzz")}], False, "other fingerprint")]
-    for comments, want, name in reuse_cases:
-        ok = prior_pass(comments, "app[bot]", "abc") == want
-        f += 0 if ok else 1
-        print("ok  " if ok else "FAIL", name)
+    # reviewer inputs: ratchet evasions
+    f += _case("REVIEW marker moved to a comment", fx_mod("scripts/a.py", "# --selftest", "if '--selftest' in sys.argv:"), "T2", "selftest_count_lowered")
+    f += _case("REVIEW marker moved to a // comment", fx_mod("scripts/a.js", "// --selftest", "if (argv.has('--selftest')) {"), "T2", "selftest_count_lowered")
+    f += _case("REVIEW marker moved to another file",
+               fx_mod("scripts/a.py", "pass", "if '--selftest' in sys.argv:") + fx_mod("scripts/b.py", "if '--selftest' in sys.argv:", "pass"),
+               "T2", "selftest_count_lowered")
+    f += _case("REVIEW pure rename out of the selftest list", fx_rename("scripts/a.py", "src_helpers/a.py"), "T2", "selftest_script_left")
+    f += _case("REVIEW pure rename deeper, out of the glob", fx_rename("scripts/a.py", "scripts/sub/a.py"), "T2", "selftest_script_left")
+    f += _case("rename inside the selftest list is fine", fx_rename("scripts/a.py", "scripts/b.py"), "T1")
+    f += _case("deleted selftest script", fx_del("scripts/a.py"), "T2", "selftest_script_left")
+    ok = code_part("x = '# not a comment'  # real") == "x = '# not a comment'  "
+    f += 0 if ok else 1
+    print("ok  " if ok else "FAIL", "comment finder respects quotes")
+
+    # reviewer input: the patch-id cache is gone, so a moved hunk gets a fresh review
+    ok = "patch_id" not in globals() and "prior_pass" not in globals()
+    f += 0 if ok else 1
+    print("ok  " if ok else "FAIL", "REVIEW no patch-id cache to reuse a PASS")
+
+    # who backs a T2 decision: GitHub (owned path) or the gate (content-based)
+    owned = classify(fx_mod("migrations/1.sql"), POLICY, _api(fx_mod("migrations/1.sql")), "t", STRIP_OK)
+    unlisted = classify(fx_mod("src/a.py"), POLICY, _api(fx_mod("src/a.py")), "t", STRIP_OK)
+    ratchet = classify(fx_del("scripts/test_a.py"), POLICY, _api(fx_del("scripts/test_a.py")), "t", STRIP_OK)
+    new_file = classify(fx_new("content/b.md"), POLICY, _api(fx_new("content/b.md")), "t", STRIP_OK)
+    mixed_diff = fx_del("scripts/test_a.py") + fx_mod("migrations/1.sql")
+    mixed = classify(mixed_diff, POLICY, _api(mixed_diff), "t", STRIP_OK)
+    ok = owned["owner_backstop"] and unlisted["owner_backstop"] and mixed["owner_backstop"]
+    ok = ok and not ratchet["owner_backstop"] and not new_file["owner_backstop"]
+    f += 0 if ok else 1
+    print("ok  " if ok else "FAIL", "owner backstop only where a path forces a code owner")
 
     # policy parsing, including the shipped template
     here = os.path.dirname(os.path.abspath(__file__))
     with tempfile.TemporaryDirectory() as tmp:
-        bad = os.path.join(tmp, "bad.yml")
-        for text, name in [("version: 1\nversion: 2\n", "duplicate key"), ("tiers: [a]\n", "flow syntax"),
-                           ("a: &x 1\n", "anchor"), ("version: 1\n", "schema: missing keys")]:
+        bad = os.path.join(tmp, "bad.json")
+        for text, name in [('{"version": 1, "version": 2}', "duplicate key"), ("version: 1\n", "not JSON"),
+                           ('{"version": 1}', "schema: missing keys")]:
             with open(bad, "w", encoding="utf-8") as handle:
                 handle.write(text)
             got = load_policy(bad, os.path.join(here, "policy-schema.json"))[0]
@@ -707,7 +664,7 @@ def selftest():
         ok = list_selftests(tmp, POLICY) == ["scripts/a.py"]
         f += 0 if ok else 1
         print("ok  " if ok else "FAIL", "list_selftests finds markers only")
-    template = os.path.join(here, "..", "templates", "factory-tiers.yml")
+    template = os.path.join(here, "..", "templates", "factory-tiers.json")
     policy, error = load_policy(template, os.path.join(here, "policy-schema.json"))
     f += 0 if policy else 1
     print("ok  " if policy else "FAIL", "shipped template policy loads", error or "")

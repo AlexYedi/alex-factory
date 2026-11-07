@@ -1,9 +1,9 @@
 {
   "title": "factory-tiers policy",
-  "description": "Schema for .github/factory-tiers.yml. Anything not listed in a tier is T2.",
+  "description": "Schema for .github/factory-tiers.json. Anything not listed in a tier is T2.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "tests_command", "tiers"],
+  "required": ["version", "tests_command", "code_owners", "tiers"],
   "properties": {
     "version": {"type": "integer", "enum": [1]},
     "tests_command": {
@@ -11,12 +11,16 @@
       "minLength": 1,
       "description": "Shell command factory-tests runs on the PR head. Use \"true\" for a repo with no tests."
     },
+    "code_owners": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Logins whose APPROVED review clears T2 that CODEOWNERS cannot enforce. Teams are not supported."
+    },
     "selftest_globs": {
       "type": "array",
       "items": {"type": "string", "minLength": 1},
-      "description": "Files factory-tests runs with the selftest marker when they contain it."
+      "description": "Files factory-tests runs with --selftest when they contain that flag outside a comment."
     },
-    "selftest_marker": {"type": "string", "minLength": 1},
     "tiers": {
       "type": "object",
       "additionalProperties": false,
@@ -35,11 +39,6 @@
       "type": "array",
       "items": {"type": "string", "minLength": 1},
       "description": "Literal strings that escalate to T2 when on a changed line, e.g. for skills touching gates."
-    },
-    "test_globs": {
-      "type": "array",
-      "items": {"type": "string", "minLength": 1},
-      "description": "What counts as a test file for the deleted-test ratchet."
     }
   }
 }
