@@ -1,0 +1,34 @@
+# Copy to .github/CODEOWNERS and replace every @YOUR_LOGIN. factory-gate fails
+# until you do. Mirrors the tiers: the last matching line wins, and a pattern with
+# no owner means nobody's approval is required by CODEOWNERS.
+#
+# This file makes GitHub ask for a review. The gate enforces T2 itself, because
+# CODEOWNERS is case-sensitive and can't express "new file".
+#
+# 1. Default: everything needs a code owner (matches the T2 default).
+*                 @YOUR_LOGIN
+
+# 2. T0 and T1 paths from factory-tiers.json: unowned, so the App's approval counts.
+/docs/reference/
+/docs/evidence/
+/scripts/
+/src/
+/skills/
+
+# 3. T2 paths inside those folders go back to the owner. Keep these last.
+/scripts/lint_*.py         @YOUR_LOGIN
+/scripts/guard_*.py        @YOUR_LOGIN
+**/.github/**              @YOUR_LOGIN
+**/CODEOWNERS              @YOUR_LOGIN
+**/CLAUDE.md               @YOUR_LOGIN
+**/AGENTS.md               @YOUR_LOGIN
+**/.claude/hooks/**        @YOUR_LOGIN
+**/.claude/settings*.json  @YOUR_LOGIN
+**/.claude/agents/**       @YOUR_LOGIN
+**/.gitignore              @YOUR_LOGIN
+**/.gitleaksignore         @YOUR_LOGIN
+**/.gitattributes          @YOUR_LOGIN
+**/.env*                   @YOUR_LOGIN
+**/.mcp.json               @YOUR_LOGIN
+**/.husky/**               @YOUR_LOGIN
+**/.githooks/**            @YOUR_LOGIN

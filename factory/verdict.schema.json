@@ -1,0 +1,28 @@
+{
+  "title": "factory review verdict",
+  "description": "No free-text fields on purpose: model prose is an exfiltration channel. class is an enum; file and quote are checked against the diff.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reviewed", "findings"],
+  "properties": {
+    "reviewed": {"type": "boolean"},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "class", "file", "line", "quote"],
+        "properties": {
+          "severity": {"type": "string", "enum": ["blocking", "advisory"]},
+          "class": {
+            "type": "string",
+            "enum": ["correctness", "security", "privacy", "invariant", "test_gaming", "other"]
+          },
+          "file": {"type": "string"},
+          "line": {"type": "integer", "minimum": 0},
+          "quote": {"type": "string"}
+        }
+      }
+    }
+  }
+}

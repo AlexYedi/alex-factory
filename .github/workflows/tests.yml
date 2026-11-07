@@ -1,0 +1,66 @@
+# factory-tests: runs PR code, so it is assumed hostile. No secrets and read-only.
+# The caller comes from the PR head, so a PR can edit this path; that is why
+# .github/** is T2 and why nothing here is trusted by the gate.
+name: factory-tests
+on:
+  workflow_call:
+    inputs:
+      core_sha:
+        description: Full SHA of alex-factory, the same one the caller pins.
+        type: string
+        required: true
+      core_repository:
+        type: string
+        default: AlexYedi/alex-factory
+      policy_path:
+        type: string
+        default: .github/factory-tiers.json
+permissions:
+  contents: read
+jobs:
+  factory-tests:
+    name: factory-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Check out factory core
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.core_repository }}
+          ref: ${{ inputs.core_sha }}
+          path: _factory
+          persist-credentials: false
+      - name: Read tests_command from the base policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          POLICY_PATH: ${{ inputs.policy_path }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/contents/$POLICY_PATH?ref=$BASE_SHA" \
+            -H 'Accept: application/vnd.github.raw+json' > "$RUNNER_TEMP/policy.json"
+          python3 _factory/factory/risk_tier.py --policy "$RUNNER_TEMP/policy.json" \
+            --print-tests-command > "$RUNNER_TEMP/tests-command"
+          python3 _factory/factory/risk_tier.py --policy "$RUNNER_TEMP/policy.json" \
+            --list-selftests . > "$RUNNER_TEMP/selftests"
+          # PR code must not see the core checkout.
+          rm -rf _factory
+      - name: Run every selftest
+        run: |
+          set -euo pipefail
+          while IFS= read -r script; do
+            [ -n "$script" ] || continue
+            echo "selftest: $script"
+            python3 "$script" --selftest
+          done < "$RUNNER_TEMP/selftests"
+      - name: Run tests_command
+        run: bash -euo pipefail "$RUNNER_TEMP/tests-command"

@@ -1,0 +1,44 @@
+{
+  "title": "factory-tiers policy",
+  "description": "Schema for .github/factory-tiers.json. Anything not listed in a tier is T2.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "tests_command", "code_owners", "tiers"],
+  "properties": {
+    "version": {"type": "integer", "enum": [1]},
+    "tests_command": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Shell command factory-tests runs on the PR head. Use \"true\" for a repo with no tests."
+    },
+    "code_owners": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Logins whose APPROVED review clears T2 that CODEOWNERS cannot enforce. Teams are not supported."
+    },
+    "selftest_globs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Files factory-tests runs with --selftest when they contain that flag outside a comment."
+    },
+    "tiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "t0": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "t1": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "t2": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "t2_new_file_globs": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Paths that may be edited at a lower tier, but where a new file is T2."
+    },
+    "t2_if_diff_contains": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Literal strings that escalate to T2 when on a changed line, e.g. for skills touching gates."
+    }
+  }
+}

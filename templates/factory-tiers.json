@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "tests_command": "pytest -q",
+  "code_owners": ["YOUR_LOGIN"],
+  "selftest_globs": ["scripts/*.py"],
+  "tiers": {
+    "t0": ["docs/reference/**", "docs/evidence/**"],
+    "t1": ["scripts/**", "src/**", "skills/**"],
+    "t2": ["scripts/lint_*.py", "scripts/guard_*.py", "migrations/**"]
+  },
+  "t2_new_file_globs": ["content/**"],
+  "t2_if_diff_contains": ["needs_review"]
+}
