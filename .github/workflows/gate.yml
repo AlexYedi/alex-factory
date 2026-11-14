@@ -232,6 +232,29 @@ jobs:
           app-id: ${{ secrets.FACTORY_APP_ID }}
           private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
+          # Only what decide uses, whatever else the App is granted.
+          permission-contents: read
+          permission-pull-requests: write
+          permission-checks: write
+      # factory-verdict is the check the ruleset should require from this App. Only a
+      # run holding the App key can post it, and the key lives in an environment that
+      # only main can use, so a workflow added by a PR cannot fake it (a GitHub Actions
+      # check can be faked by any job with the same name). It opens as in_progress and
+      # only the last step can complete it as success: a crash in between leaves it
+      # unfinished, which blocks the merge.
+      - name: Open the verdict check
+        id: check
+        if: steps.app.outputs.token != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          id="$(gh api -X POST "repos/$REPO/check-runs" -f name=factory-verdict \
+            -f head_sha="$HEAD_SHA" -f status=in_progress --jq .id)"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
       - name: Read reviews live
         if: steps.app.outputs.token != ''
         env:
@@ -277,12 +300,39 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           APP_LOGIN: ${{ inputs.app_slug }}[bot]
           RC: ${{ steps.decide.outputs.rc }}
+          CHECK_ID: ${{ steps.check.outputs.id }}
         run: |
           # The verdict's exit code is the check result. A failed comment or label
           # never turns a BLOCK into a pass, and a failed approval fails the check.
           set -u
           out="$RUNNER_TEMP/gate"
           code="${RC:-1}"
+          # Whatever path this step exits by, factory-verdict ends with the same result
+          # as this job: success only for an exit 0 on PASS or HOLD. Its text is the
+          # outcome alone, as in the logs.
+          finish() {
+            local rc="$1" outcome conclusion
+            outcome="$(jq -r '.outcome // "BLOCK"' "$out/decision.json" 2> /dev/null || echo BLOCK)"
+            conclusion=failure
+            if [ "$rc" = 0 ] && { [ "$outcome" = PASS ] || [ "$outcome" = HOLD ]; }; then
+              conclusion=success
+            fi
+            if [ -n "${CHECK_ID:-}" ] && [ -n "$GH_TOKEN" ]; then
+              gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" -f status=completed \
+                -f conclusion="$conclusion" -f 'output[title]'="$outcome" \
+                -f 'output[summary]'="factory-gate: $outcome" > /dev/null \
+                || { echo "verdict check not completed"; exit 1; }
+            fi
+          }
+          trap 'finish $?' EXIT
+          # A cancel or kill is never a success, even when the last command was.
+          trap 'trap - EXIT; finish 1; exit 1' INT TERM
+          # The token is here but the check didn't open: an earlier success on this
+          # commit could still be the latest factory-verdict, so this job goes red.
+          if [ -n "$GH_TOKEN" ] && [ -z "${CHECK_ID:-}" ]; then
+            echo "verdict check not opened"
+            exit 1
+          fi
           if [ ! -s "$out/decision.json" ]; then
             echo "no decision"
             exit 1

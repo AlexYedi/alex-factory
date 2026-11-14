@@ -36,6 +36,7 @@ NOTES = {
     "gate_data_missing": "The gate's saved data has expired. Re-run all jobs or push a commit.",
     "classify_failed": "The classify job failed. Check its log, then re-run all jobs.",
     "app_approval_dismissed": "The App's approval of this commit was dismissed, so it won't approve it again.",
+    "owner_changes_requested": "A code owner requested changes. Their next approval clears it.",
 }
 
 
@@ -124,6 +125,20 @@ def owner_approved(reviews, owners, head_sha):
     return any(r["state"] == "APPROVED" and r.get("commit_id") == head_sha for r in states)
 
 
+def owner_requested_changes(reviews, owners):
+    """True if any code owner's latest deciding review requests changes, on any commit.
+
+    With no required approvals, GitHub no longer enforces this, so the gate does, on every tier.
+    """
+    wanted = {owner.casefold() for owner in owners or []}
+    latest = {}
+    for review in reviews or []:
+        login = ((review.get("user") or {}).get("login") or "").casefold()
+        if login in wanted and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            latest[login] = review
+    return any(r["state"] == "CHANGES_REQUESTED" for r in latest.values())
+
+
 def human_gate(owner_ok, reasons, outcome="HOLD"):
     """A person decides, and the App never approves. Red until a code owner has."""
     if owner_ok:
@@ -176,6 +191,8 @@ def decide(tier_doc, clean, review_result, stripped, schema, reviews=None, head_
     if not tier_doc.get("same_repo"):
         return human_gate(owner_ok, ["fork_not_auto_reviewed"])
     reasons = sorted({r["code"] for r in tier_doc.get("reasons", [])})
+    if owner_requested_changes(reviews, tier_doc.get("owners")):
+        return block(tier, reasons + ["owner_changes_requested"])
     if tier_doc.get("sticky_block"):
         return block(tier, reasons + ["sticky_block"])
 
@@ -452,6 +469,21 @@ def selftest():
     check("stale dismissal of an older commit still re-approves", out["outcome"] == "PASS" and out["approve"])
     out = decide(tier("T0"), None, "skipped", diff, schema, gone, head, "app[bot]")
     check("T0 refuses re-approval after dismissal too", out["outcome"] == "BLOCK" and not out["approve"])
+
+    # REVIEW3: at 0 required approvals the gate is the only veto
+    asked = [{"user": {"login": "Owner"}, "state": "CHANGES_REQUESTED", "commit_id": "d" * 40}]
+    out = decide(tier("T0"), None, "skipped", diff, schema, asked, head)
+    check("REVIEW3 owner changes-requested blocks T0", out["outcome"] == "BLOCK" and not out["approve"]
+          and "owner_changes_requested" in out["reasons"])
+    out = decide(tier(), clean(good), "success", diff, schema, asked, head)
+    check("REVIEW3 owner changes-requested blocks a clean T1", out["outcome"] == "BLOCK" and not out["approve"])
+    out = decide(tier("T2"), clean(good), "success", diff, schema, asked, head)
+    check("REVIEW3 owner changes-requested blocks T2", out["outcome"] == "BLOCK")
+    out = decide(tier(), clean(good), "success", diff, schema, asked + approved, head)
+    check("REVIEW3 a later owner approval clears it", out["outcome"] == "PASS" and out["approve"])
+    other = [{"user": {"login": "someone"}, "state": "CHANGES_REQUESTED", "commit_id": head}]
+    out = decide(tier(), clean(good), "success", diff, schema, other, head)
+    check("REVIEW3 a non-owner's changes-requested doesn't block", out["outcome"] == "PASS")
 
     # content T2 needs an owner, like every other T2
     out = run(tier("T2"), clean(good))

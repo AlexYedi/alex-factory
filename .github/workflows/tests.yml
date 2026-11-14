@@ -46,8 +46,21 @@ jobs:
           POLICY_PATH: ${{ inputs.policy_path }}
         run: |
           set -euo pipefail
-          gh api "repos/$REPO/contents/$POLICY_PATH?ref=$BASE_SHA" \
-            -H 'Accept: application/vnd.github.raw+json' > "$RUNNER_TEMP/policy.json"
+          # No policy on the base is the adoption PR, and only that: the base is main,
+          # which a PR cannot change. Nothing is configured to run yet, so skip with a
+          # notice. Any other read failure still fails.
+          if ! gh api "repos/$REPO/contents/$POLICY_PATH?ref=$BASE_SHA" \
+            -H 'Accept: application/vnd.github.raw+json' > "$RUNNER_TEMP/policy.json" 2> "$RUNNER_TEMP/policy.err"; then
+            if grep -q 'Not Found (HTTP 404)' "$RUNNER_TEMP/policy.err"; then
+              echo "::warning::factory-tests: no $POLICY_PATH on the base branch yet (adoption PR); nothing to run."
+              echo true > "$RUNNER_TEMP/tests-command"
+              : > "$RUNNER_TEMP/selftests"
+              rm -rf _factory
+              exit 0
+            fi
+            cat "$RUNNER_TEMP/policy.err"
+            exit 1
+          fi
           python3 _factory/factory/risk_tier.py --policy "$RUNNER_TEMP/policy.json" \
             --print-tests-command > "$RUNNER_TEMP/tests-command"
           python3 _factory/factory/risk_tier.py --policy "$RUNNER_TEMP/policy.json" \
