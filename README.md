@@ -62,12 +62,15 @@ repository that you are adopting.
 ### 1. Create the GitHub App (once per account)
 
 1. Settings, Developer settings, GitHub Apps, New GitHub App.
-2. Repository permissions: **Pull requests: Read and write**, **Contents: Read-only**.
+2. Repository permissions: **Pull requests: Read and write**, **Checks: Read and write**,
+   **Contents: Read-only**.
 3. Webhook: **Active off**. Install on: **Only on this account**.
 4. Generate a private key and note the App ID and slug.
 5. Install the App on `OWNER/REPO`.
 
-The App can approve and comment. It cannot push, and it can never satisfy CODEOWNERS.
+The App can approve, comment and post the `factory-verdict` check. It cannot push. Its approval
+doesn't count toward GitHub's required reviews (it isn't a collaborator), so the ruleset relies
+on `factory-verdict` instead.
 
 ### 2. Create two environments
 
@@ -135,13 +138,23 @@ definitions are T2 at any depth, whatever the policy says.
 
 | Setting | Value |
 |---|---|
-| Required checks | `scan`, `factory-tests / factory-tests`, `factory-gate / factory-gate` |
-| Check source for each | GitHub Actions (`integration_id: 15368`) |
+| Required checks | `scan`, `factory-tests / factory-tests`, `factory-gate / factory-gate`, `factory-verdict` |
+| Check source | GitHub Actions (`integration_id: 15368`) for the first three; your App (`integration_id` = App ID) for `factory-verdict` |
 | Require branches up to date | on |
-| Required approving reviews | 1 |
+| Required approving reviews | 0 |
 | Dismiss stale approvals | on |
-| Require review from code owners | on |
+| Require review from code owners | on (GitHub stops enforcing it at 0 approvals; T2 is enforced by the gate) |
 | Allowed merge methods | squash |
+
+Why 0 approvals and an App check. GitHub doesn't count the App's approval, so with 1 required
+every PR would need a person, including T0 and T1. At 0, GitHub enforces no review at all, so
+the gate's verdict has to be unforgeable. A GitHub Actions check isn't: a PR can add a workflow
+whose job has the same name and passes. `factory-verdict` can only be posted with the App key,
+which only a run from `main` can reach. It is the check that matters; the others stay required
+so a red job is visible on the PR.
+
+Add `factory-verdict` to the ruleset only after one PR has run on the new core, so the check has
+appeared once. Until then the ruleset can't select it by App.
 
 Repository settings: allow auto-merge on. "Allow GitHub Actions to create and approve pull
 requests" stays **off**: approval comes from the App, never from `GITHUB_TOKEN`.
@@ -190,7 +203,8 @@ Everything below needs a live GitHub repository. None of it has been exercised y
   by name, and re-running a single job keeping the original event and artifacts. If it fails,
   the check stays red and a manual re-run of the job has the same effect.
 - Environment branch policies refusing a PR run, and a PR targeting a non-main base.
-- A GitHub App approval counting toward the required review count.
+- ~~A GitHub App approval counting toward the required review count.~~ It doesn't, which is why
+  `factory-verdict` exists.
 - Exact required-check context names, and `integration_id` pinning for reusable workflows.
 - `actions/checkout` of this public repository under `permissions: {}`.
 - The compare API returning a diff for a fork's head SHA. A failure resolves to T2.
