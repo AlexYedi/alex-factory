@@ -325,6 +325,14 @@ jobs:
             fi
           }
           trap 'finish $?' EXIT
+          # A cancel or kill is never a success, even when the last command was.
+          trap 'trap - EXIT; finish 1; exit 1' INT TERM
+          # The token is here but the check didn't open: an earlier success on this
+          # commit could still be the latest factory-verdict, so this job goes red.
+          if [ -n "$GH_TOKEN" ] && [ -z "${CHECK_ID:-}" ]; then
+            echo "verdict check not opened"
+            exit 1
+          fi
           if [ ! -s "$out/decision.json" ]; then
             echo "no decision"
             exit 1

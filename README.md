@@ -66,7 +66,10 @@ repository that you are adopting.
    **Contents: Read-only**.
 3. Webhook: **Active off**. Install on: **Only on this account**.
 4. Generate a private key and note the App ID and slug.
-5. Install the App on `OWNER/REPO`.
+5. Install the App on `OWNER/REPO`. Use one App per gated repository (see Known limits).
+6. When you change a permission later, accept it on the installation too (Settings,
+   Applications, the App, Review request). Until then the token can't be minted and every PR
+   goes red with no comment.
 
 The App can approve, comment and post the `factory-verdict` check. It cannot push. Its approval
 doesn't count toward GitHub's required reviews (it isn't a collaborator), so the ruleset relies
@@ -153,8 +156,16 @@ whose job has the same name and passes. `factory-verdict` can only be posted wit
 which only a run from `main` can reach. It is the check that matters; the others stay required
 so a red job is visible on the PR.
 
-Add `factory-verdict` to the ruleset only after one PR has run on the new core, so the check has
-appeared once. Until then the ruleset can't select it by App.
+Order matters. Lowering approvals before `factory-verdict` is required leaves `main` guarded only
+by checks a PR can fake.
+
+1. Merge the core version that posts `factory-verdict`, with approvals still at 1.
+2. Open any PR and confirm `factory-verdict` appears, from the App.
+3. Add `factory-verdict` (App source) to the required checks.
+4. Only then set required approvals to 0.
+
+The gate is the only veto at 0 approvals: a code owner's latest "Request changes" blocks every
+tier until that owner approves.
 
 Repository settings: allow auto-merge on. "Allow GitHub Actions to create and approve pull
 requests" stays **off**: approval comes from the App, never from `GITHUB_TOKEN`.
@@ -209,13 +220,26 @@ Everything below needs a live GitHub repository. None of it has been exercised y
 - `actions/checkout` of this public repository under `permissions: {}`.
 - The compare API returning a diff for a fork's head SHA. A failure resolves to T2.
 - `claude -p` with `CLAUDE_CODE_OAUTH_TOKEN`, on a Linux runner, under `env -i`.
+- Which of several `factory-verdict` runs on one commit GitHub counts (assumed the latest).
+- That code-owner review is unenforced at 0 approvals in every case. If GitHub still enforces it,
+  unowned T0 and T1 paths are unaffected, but owned paths would also need an owner review.
 
 ## Known limits
 
-- **A required check name can be forged.** A PR adding a workflow with the same job name can
-  report that check from GitHub Actions too, and pinning `integration_id` doesn't prevent
-  this. The control that holds is the review requirement: such a PR touches `.github/**`, is
-  T2, and only a human can approve it.
+- **GitHub Actions check names can be forged.** A PR adding a workflow with the same job name
+  can report `scan`, `factory-tests` or `factory-gate` too, and pinning `integration_id` doesn't
+  prevent it. The control that holds is `factory-verdict`, which only the App key can post.
+- **Re-checking after a review relies on PR-controlled workflows.** A dismissal or changes-request
+  only takes effect when decide re-runs, through the relay (which runs from the PR head) and the
+  rerun job (which finds the job by name). A PR that breaks either touches `.github/**`, so it is
+  T2 and needed an owner's approval; the gap is an owner retracting after approving. Re-run the
+  job by hand, or push, after retracting.
+- **The App key is the trust root for every repo it is installed on.** Any repo holding the key
+  can mint a token for another installed repo and post `factory-verdict` there. Use one App per
+  gated repo, or install it only where the key sits under the same main-only environment.
+- **A stale success can outlive a failed re-run on the same commit.** If a re-run can't open its
+  check, `factory-gate` goes red but the earlier `factory-verdict` success stays. Keep
+  `factory-gate / factory-gate` required as that backstop.
 - **Model review is a filter, not a proof.** Stripping and phrase matching are one layer. An
   injection the model obeys can still suppress a finding on a T1 change.
 - **The CLI is pinned by version, not by integrity hash.** A lockfile would close that.

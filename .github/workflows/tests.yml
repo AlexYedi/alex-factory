@@ -51,8 +51,8 @@ jobs:
           # notice. Any other read failure still fails.
           if ! gh api "repos/$REPO/contents/$POLICY_PATH?ref=$BASE_SHA" \
             -H 'Accept: application/vnd.github.raw+json' > "$RUNNER_TEMP/policy.json" 2> "$RUNNER_TEMP/policy.err"; then
-            if grep -q 'HTTP 404' "$RUNNER_TEMP/policy.err"; then
-              echo "::notice::factory-tests: no $POLICY_PATH on the base branch yet (adoption PR); nothing to run."
+            if grep -q 'Not Found (HTTP 404)' "$RUNNER_TEMP/policy.err"; then
+              echo "::warning::factory-tests: no $POLICY_PATH on the base branch yet (adoption PR); nothing to run."
               echo true > "$RUNNER_TEMP/tests-command"
               : > "$RUNNER_TEMP/selftests"
               rm -rf _factory
