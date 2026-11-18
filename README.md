@@ -257,4 +257,8 @@ Everything below needs a live GitHub repository. None of it has been exercised y
   re-running all jobs or pushing refreshes it.
 - **A dismissal binds to one commit.** After the App's approval is dismissed it won't re-approve
   that commit, but a new push gets a new review.
-- **Token expiry has no alert yet.** An expired token fails closed, so T1 PRs wait for a person.
+- **Token expiry alerts only when the CLI reports a date.** An expired token fails closed, so T1
+  PRs wait for a person. The review job warns (annotation and job summary) at 14 days or fewer,
+  from the CLI's `credential_expires_at`, and logs `token_days=unknown` when it has none. The CLI
+  documents that field as absent for a token taken from the environment, which is how the gate
+  passes it, so check the first live run's log before relying on the alert.

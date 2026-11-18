@@ -16,11 +16,16 @@ exact commit: the gate cannot see what CODEOWNERS covers, so it never assumes it
 A model BLOCK is sticky per diff, so an empty commit can't re-roll it.
 """
 import argparse
+import contextlib
+import io
 import json
+import math
 import os
 import re
 import sys
 import tempfile
+import time
+from datetime import datetime, timezone
 
 from minischema import validate
 from risk_tier import DiffError, _flatten, _read_json, classify, parse_diff, sticky_marker
@@ -29,6 +34,7 @@ MIN_QUOTE_CHARS = 8
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 DEFAULT_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verdict.schema.json")
 MAX_LISTED = 20
+TOKEN_WARN_DAYS = 14
 COMMENT_MARKER = "<!-- factory-gate -->"
 NOTES = {
     "owner_approval_required": "A code owner must approve this commit. The App never approves T2.",
@@ -104,6 +110,60 @@ def sanitize(envelope, cli_rc, stripped, schema):
     result["verdict"] = {"reviewed": verdict["reviewed"],
                          "findings": verify_findings(verdict["findings"], diff_index(stripped))}
     return result
+
+
+def token_days_left(envelope, now):
+    """Whole days until the CLI's credential ends, or None when unknown.
+
+    Read from the envelope's top level only: structured_output is the model's, so a
+    date inside it must never count. The CLI sends ISO 8601; epoch seconds or
+    milliseconds are accepted too. Anything else is unknown, never an error.
+    """
+    if not isinstance(envelope, dict):
+        return None
+    value = envelope.get("credential_expires_at")
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            seconds = value / 1000 if value > 1e11 else value
+        elif isinstance(value, str):
+            when = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = when.timestamp()
+        else:
+            return None
+        return math.floor((seconds - now) / 86400)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def token_warning(days):
+    """The rotation alert for a day count, or None. Only the integer is ever shown."""
+    if days is None or days > TOKEN_WARN_DAYS:
+        return None
+    if days <= 0:
+        return f"Claude OAuth token has probably expired ({days} days) - rotate CLAUDE_CODE_OAUTH_TOKEN"
+    return f"Claude OAuth token expires in {days} days - rotate CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def report_token_expiry(envelope, now=None):
+    """Warn in the log and job summary. Never raises and never touches the verdict."""
+    try:
+        days = token_days_left(envelope, time.time() if now is None else now)
+        message = token_warning(days)
+        if message:
+            print(f"::warning::{message}")
+            summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if summary:
+                with open(summary, "a", encoding="utf-8") as handle:
+                    handle.write(f"- {message}\n")
+        return days
+    except Exception:  # an alert must never fail the gate
+        return None
 
 
 def block(tier, reasons, blocking=()):
@@ -296,11 +356,16 @@ def main():
     stripped = _load_text(args.diff)
 
     if args.sanitize:
-        clean = sanitize(_load_json(args.envelope), args.cli_rc, stripped, schema)
+        envelope = _load_json(args.envelope)
+        clean = sanitize(envelope, args.cli_rc, stripped, schema)
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(clean, handle, indent=2)
+        # The day count only, never the date: the log is public. It stays out of the
+        # verdict, so the alert can't move the outcome or the tier.
+        days = report_token_expiry(envelope)
         print(f'sanitized: cli_ok={clean["cli_ok"]} malformed={clean["malformed"]} '
-              f'status={clean["error_status"]} usage={clean["usage"]}')
+              f'status={clean["error_status"]} usage={clean["usage"]} '
+              f'token_days={"unknown" if days is None else days}')
         return 0
 
     if not args.decide:
@@ -542,6 +607,63 @@ def selftest():
     check("REVIEW2 artifacts kept 30 days", gate.count("retention-days: 30") == 2 and "retention-days: 1\n" not in gate)
     caller = _load_text(os.path.join(os.path.dirname(DEFAULT_SCHEMA), "..", "templates", "workflows", "factory-gate.yml")) or ""
     check("REVIEW2 concurrency group includes the head SHA", "pull_request.head.sha }}" in caller.split("concurrency:")[1].split("jobs:")[0])
+
+    # YED-355: early warning before the OAuth token lapses
+    now = 1_800_000_000
+    iso = lambda d: datetime.fromtimestamp(now + d * 86400, timezone.utc).isoformat().replace("+00:00", "Z")
+    days = lambda v: token_days_left({"credential_expires_at": v}, now)
+    check("token 30 days out: no warning", days(iso(30)) == 30 and token_warning(30) is None)
+    check("token 15 days out: no warning", token_warning(days(iso(15))) is None)
+    check("token 14 days out: warns", days(iso(14)) == 14 and "expires in 14 days" in token_warning(14))
+    check("token 3 days out: warns", "expires in 3 days" in token_warning(days(iso(3))))
+    check("token expiring now: warns", days(iso(0)) == 0 and "probably expired (0 days)" in token_warning(0))
+    check("token already expired: warns with negative days", days(iso(-2)) == -2 and "(-2 days)" in token_warning(-2))
+    check("half a day short of 15 rounds down and warns", token_warning(days(iso(14.5))) is not None)
+    check("ISO offset form parses", days(datetime.fromtimestamp(now + 5 * 86400, timezone.utc).isoformat()) == 5)
+    check("naive ISO reads as UTC", days(datetime.fromtimestamp(now + 5 * 86400, timezone.utc).replace(tzinfo=None).isoformat()) == 5)
+    check("epoch seconds parse", days(now + 7 * 86400) == 7)
+    check("epoch milliseconds parse", days((now + 7 * 86400) * 1000) == 7)
+    check("epoch as a digit string parses", days(str(now + 7 * 86400)) == 7)
+    check("missing field: unknown, no warning", token_days_left({"is_error": False}, now) is None and token_warning(None) is None)
+    check("non-dict envelope: unknown", token_days_left(None, now) is None and token_days_left([1], now) is None)
+    for bad in ["soon", "", "2026-13-45", True, None, {"at": 1}, float("nan"), float("inf"), 10 ** 400, "9" * 400]:
+        check(f"malformed {str(bad)[:12]!r}: unknown, no warning", days(bad) is None)
+    check("HOSTILE date inside structured_output is ignored",
+          token_days_left({"structured_output": {"credential_expires_at": iso(1)}}, now) is None)
+
+    # the alert prints the day count only, writes the summary, and never moves the verdict
+    with tempfile.TemporaryDirectory() as tmp:
+        # main() reads the real clock, so this date is relative to it
+        when = datetime.fromtimestamp(time.time() + 3.5 * 86400, timezone.utc).isoformat()
+        env_path, out_path, summary = (os.path.join(tmp, n) for n in ("envelope.json", "clean.json", "summary.md"))
+        with open(env_path, "w", encoding="utf-8") as handle:
+            json.dump(envelope(good, credential_expires_at=when), handle)
+        with open(os.path.join(tmp, "diff"), "w", encoding="utf-8") as handle:
+            handle.write(diff)
+        sys.argv = ["factory_verdict.py", "--sanitize", "--envelope", env_path, "--cli-rc", "0",
+                    "--diff", os.path.join(tmp, "diff"), "--out", out_path]
+        before = os.environ.get("GITHUB_STEP_SUMMARY")
+        os.environ["GITHUB_STEP_SUMMARY"] = summary
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                rc = main()
+        finally:
+            if before is None:
+                os.environ.pop("GITHUB_STEP_SUMMARY", None)
+            else:
+                os.environ["GITHUB_STEP_SUMMARY"] = before
+        logged, summary_text = buffer.getvalue(), _load_text(summary) or ""
+        saved = _load_text(out_path) or ""
+        check("sanitize warns at 3 days and still exits 0", rc == 0 and "::warning::Claude OAuth token expires in" in logged)
+        check("sanitize logs the day count", "token_days=" in logged)
+        check("job summary gets the alert", "rotate CLAUDE_CODE_OAUTH_TOKEN" in summary_text)
+        check("the expiry date reaches neither log, summary nor artifact",
+              when[:10] not in logged and when[:10] not in summary_text and when[:10] not in saved)
+        check("the alert leaves the sanitized verdict unchanged",
+              json.loads(saved) == sanitize(envelope(good), 0, diff, schema))
+        check("an unreadable value never raises",
+              report_token_expiry({"credential_expires_at": object()}) is None)
 
     # end to end through the CLI: a missing verdict must exit non-zero
     with tempfile.TemporaryDirectory() as tmp:
