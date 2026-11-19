@@ -242,7 +242,11 @@ Everything below needs a live GitHub repository. None of it has been exercised y
   `factory-gate / factory-gate` required as that backstop.
 - **Model review is a filter, not a proof.** Stripping and phrase matching are one layer. An
   injection the model obeys can still suppress a finding on a T1 change.
-- **The CLI is pinned by version, not by integrity hash.** A lockfile would close that.
+- **The CLI is pinned by integrity hash.** The review job runs `npm ci` on `factory/cli/package-lock.json`
+  from the core checkout, so every tarball is checked against its sha512, and it fails closed if the
+  `claude_version` input disagrees with the lock. To bump, in one T2 PR: change the version in
+  `factory/cli/package.json` and the `claude_version` default in `gate.yml`, then run
+  `npm install --package-lock-only` in `factory/cli`. The self-test checks that they match.
 - **A decoy can satisfy the selftest ratchet.** Moving `--selftest` into a comment escalates,
   but moving it into an unused string does not.
 - **Selftest lists are compared by glob, not by content.** The gate has no tree, so any rename

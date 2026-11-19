@@ -639,6 +639,19 @@ def selftest():
     caller = _load_text(os.path.join(os.path.dirname(DEFAULT_SCHEMA), "..", "templates", "workflows", "factory-gate.yml")) or ""
     check("REVIEW2 concurrency group includes the head SHA", "pull_request.head.sha }}" in caller.split("concurrency:")[1].split("jobs:")[0])
 
+    # YED-355 item 2: the CLI the gate runs is the one the lockfile pins, hash and all
+    root = os.path.join(os.path.dirname(DEFAULT_SCHEMA), "..")
+    gate_text = _load_text(os.path.join(root, ".github", "workflows", "gate.yml")) or ""
+    lock = _load_json(os.path.join(root, "factory", "cli", "package-lock.json")) or {}
+    pins = re.findall(r"claude_version:.*?default:\s*([0-9][0-9.]*)", gate_text, re.S)
+    cli_pkgs = {k: v for k, v in (lock.get("packages") or {}).items() if k.startswith("node_modules/@anthropic-ai/claude-code")}
+    check("gate.yml default claude_version matches the lockfile",
+          len(pins) == 1 and cli_pkgs.get("node_modules/@anthropic-ai/claude-code", {}).get("version") == pins[0])
+    check("every locked CLI package carries a sha512 integrity",
+          len(cli_pkgs) >= 2 and all(str(v.get("integrity", "")).startswith("sha512-") for v in cli_pkgs.values()))
+    check("the gate installs with npm ci from the core checkout, not npm install",
+          "npm ci --prefix" in gate_text and "claude-code@$CLAUDE_VERSION" not in gate_text)
+
     # YED-355: early warning before the OAuth token lapses
     now = 1_800_000_000
     iso = lambda d: datetime.fromtimestamp(now + d * 86400, timezone.utc).isoformat().replace("+00:00", "Z")
