@@ -147,23 +147,26 @@ def token_days_left(envelope, now):
 
 
 def fallback_days_left(declared, now):
-    """Days left from TOKEN_EXPIRY_ENV, the date the owner records at each rotation.
+    """Days left from TOKEN_EXPIRY_ENV, the date (YYYY-MM-DD only) the owner records at each rotation.
 
     The CLI leaves credential_expires_at out for a token taken from the environment,
     which is how the gate passes it, so this is the source that normally answers in CI.
     It is a non-secret repository or environment variable, never read from the PR.
+    Anything but a plain date (e.g. 20261203, an epoch) is unknown, never a guess.
     """
-    if not isinstance(declared, str) or not declared.strip():
+    if not isinstance(declared, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", declared.strip()):
         return None
-    return _days_until(declared, now)
+    return _days_until(declared.strip(), now)
 
 
 def token_warning(days):
     """The rotation alert for a day count, or None. Only the integer is ever shown."""
     if days is None or days > TOKEN_WARN_DAYS:
         return None
-    if days <= 0:
+    if days < 0:
         return f"Claude OAuth token has probably expired ({days} days) - rotate CLAUDE_CODE_OAUTH_TOKEN"
+    if days == 0:
+        return "Claude OAuth token expires within a day - rotate CLAUDE_CODE_OAUTH_TOKEN"
     return f"Claude OAuth token expires in {days} days - rotate CLAUDE_CODE_OAUTH_TOKEN"
 
 
@@ -387,8 +390,9 @@ def main():
         clean = sanitize(envelope, args.cli_rc, stripped, schema)
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(clean, handle, indent=2)
-        # The day count only, never the date: the log is public. It stays out of the
-        # verdict, so the alert can't move the outcome or the tier.
+        # Python prints only the day count. The date itself is not secret: the step's env:
+        # block shows CLAUDE_TOKEN_EXPIRES_ON in the public log, and days + run time give it
+        # anyway. It stays out of the verdict, so the alert can't move the outcome or the tier.
         days, token_from = report_token_expiry(envelope)
         print(f'sanitized: cli_ok={clean["cli_ok"]} malformed={clean["malformed"]} '
               f'status={clean["error_status"]} usage={clean["usage"]} '
@@ -643,7 +647,7 @@ def selftest():
     check("token 15 days out: no warning", token_warning(days(iso(15))) is None)
     check("token 14 days out: warns", days(iso(14)) == 14 and "expires in 14 days" in token_warning(14))
     check("token 3 days out: warns", "expires in 3 days" in token_warning(days(iso(3))))
-    check("token expiring now: warns", days(iso(0)) == 0 and "probably expired (0 days)" in token_warning(0))
+    check("token expiring within a day: warns, not 'expired'", days(iso(0)) == 0 and "within a day" in token_warning(0))
     check("token already expired: warns with negative days", days(iso(-2)) == -2 and "(-2 days)" in token_warning(-2))
     check("half a day short of 15 rounds down and warns", token_warning(days(iso(14.5))) is not None)
     check("ISO offset form parses", days(datetime.fromtimestamp(now + 5 * 86400, timezone.utc).isoformat()) == 5)
@@ -685,7 +689,7 @@ def selftest():
         check("sanitize warns at 3 days and still exits 0", rc == 0 and "::warning::Claude OAuth token expires in" in logged)
         check("sanitize logs the day count", "token_days=" in logged)
         check("job summary gets the alert", "rotate CLAUDE_CODE_OAUTH_TOKEN" in summary_text)
-        check("the expiry date reaches neither log, summary nor artifact",
+        check("Python prints the day count, never the date (the env: block shows it anyway; not secret)",
               when[:10] not in logged and when[:10] not in summary_text and when[:10] not in saved)
         check("the alert leaves the sanitized verdict unchanged",
               json.loads(saved) == sanitize(envelope(good), 0, diff, schema))
@@ -696,9 +700,13 @@ def selftest():
     saved_env = os.environ.get(TOKEN_EXPIRY_ENV)
     try:
         day = lambda d: datetime.fromtimestamp(now + d * 86400, timezone.utc).strftime("%Y-%m-%d")
-        check("fallback date-only parses as UTC midnight", fallback_days_left(day(10), now) in (9, 10))
+        midnight = now - now % 86400
+        check("fallback date-only parses as UTC midnight",
+              fallback_days_left(datetime.fromtimestamp(midnight + 10 * 86400, timezone.utc).strftime("%Y-%m-%d"), midnight) == 10)
+        for odd in ["20261203", str(now + 86400), day(10) + "T00:00:00Z"]:
+            check(f"fallback non-date {odd!r}: unknown, not a guess", fallback_days_left(odd, now) is None)
         check("fallback empty or unset: unknown", fallback_days_left("", now) is None and fallback_days_left(None, now) is None)
-        for bad in ["soon", "2026-13-45", "  "]:
+        for bad in ["soon", "2026-13-45", "  ", "2026-1-5"]:
             check(f"fallback malformed {bad!r}: unknown", fallback_days_left(bad, now) is None)
         quiet = io.StringIO()
         with contextlib.redirect_stdout(quiet):

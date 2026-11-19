@@ -264,3 +264,5 @@ Everything below needs a live GitHub repository. None of it has been exercised y
   non-secret variable on the `factory-review` environment). Set it whenever you rotate the token:
   `gh variable set CLAUDE_TOKEN_EXPIRES_ON --env factory-review --body YYYY-MM-DD`. The log shows
   `token_days=N token_from=cli|var|none`; `none` means neither source answered, so no alert can fire.
+  The date is not secret: it shows in the step's public `env:` block, so it is a plain variable.
+  Only `YYYY-MM-DD` is read; anything else counts as unknown.
