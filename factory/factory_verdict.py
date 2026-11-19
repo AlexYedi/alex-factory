@@ -710,9 +710,9 @@ def selftest():
             check(f"fallback malformed {bad!r}: unknown", fallback_days_left(bad, now) is None)
         quiet = io.StringIO()
         with contextlib.redirect_stdout(quiet):
-            os.environ[TOKEN_EXPIRY_ENV] = iso(3)
+            os.environ[TOKEN_EXPIRY_ENV] = day(4)   # midnight UTC, 3.67 days after `now`
             got_var = report_token_expiry({"is_error": False}, now)
-            os.environ[TOKEN_EXPIRY_ENV] = iso(300)
+            os.environ[TOKEN_EXPIRY_ENV] = day(300)
             got_cli = report_token_expiry({"credential_expires_at": iso(5)}, now)
             os.environ[TOKEN_EXPIRY_ENV] = "garbage"
             got_bad = report_token_expiry({"is_error": False}, now)
