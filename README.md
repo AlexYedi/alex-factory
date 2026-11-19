@@ -257,8 +257,10 @@ Everything below needs a live GitHub repository. None of it has been exercised y
   re-running all jobs or pushing refreshes it.
 - **A dismissal binds to one commit.** After the App's approval is dismissed it won't re-approve
   that commit, but a new push gets a new review.
-- **Token expiry alerts only when the CLI reports a date.** An expired token fails closed, so T1
-  PRs wait for a person. The review job warns (annotation and job summary) at 14 days or fewer,
-  from the CLI's `credential_expires_at`, and logs `token_days=unknown` when it has none. The CLI
-  documents that field as absent for a token taken from the environment, which is how the gate
-  passes it, so check the first live run's log before relying on the alert.
+- **Token expiry alert needs one variable per adopting repo.** An expired token fails closed, so
+  T1 PRs wait for a person. The review job warns (annotation and job summary) at 14 days or fewer.
+  The CLI omits `credential_expires_at` for a token taken from the environment, which is how the
+  gate passes it, so the date normally comes from `CLAUDE_TOKEN_EXPIRES_ON` (YYYY-MM-DD, a
+  non-secret variable on the `factory-review` environment). Set it whenever you rotate the token:
+  `gh variable set CLAUDE_TOKEN_EXPIRES_ON --env factory-review --body YYYY-MM-DD`. The log shows
+  `token_days=N token_from=cli|var|none`; `none` means neither source answered, so no alert can fire.

@@ -35,6 +35,7 @@ USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache
 DEFAULT_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verdict.schema.json")
 MAX_LISTED = 20
 TOKEN_WARN_DAYS = 14
+TOKEN_EXPIRY_ENV = "CLAUDE_TOKEN_EXPIRES_ON"
 COMMENT_MARKER = "<!-- factory-gate -->"
 NOTES = {
     "owner_approval_required": "A code owner must approve this commit. The App never approves T2.",
@@ -112,16 +113,8 @@ def sanitize(envelope, cli_rc, stripped, schema):
     return result
 
 
-def token_days_left(envelope, now):
-    """Whole days until the CLI's credential ends, or None when unknown.
-
-    Read from the envelope's top level only: structured_output is the model's, so a
-    date inside it must never count. The CLI sends ISO 8601; epoch seconds or
-    milliseconds are accepted too. Anything else is unknown, never an error.
-    """
-    if not isinstance(envelope, dict):
-        return None
-    value = envelope.get("credential_expires_at")
+def _days_until(value, now):
+    """Whole days from `now` until `value` (ISO 8601, or epoch s/ms), or None when unreadable."""
     if isinstance(value, str) and value.strip().isdigit():
         value = int(value.strip())
     try:
@@ -141,6 +134,30 @@ def token_days_left(envelope, now):
         return None
 
 
+def token_days_left(envelope, now):
+    """Whole days until the CLI's credential ends, or None when unknown.
+
+    Read from the envelope's top level only: structured_output is the model's, so a
+    date inside it must never count. The CLI sends ISO 8601; epoch seconds or
+    milliseconds are accepted too. Anything else is unknown, never an error.
+    """
+    if not isinstance(envelope, dict):
+        return None
+    return _days_until(envelope.get("credential_expires_at"), now)
+
+
+def fallback_days_left(declared, now):
+    """Days left from TOKEN_EXPIRY_ENV, the date the owner records at each rotation.
+
+    The CLI leaves credential_expires_at out for a token taken from the environment,
+    which is how the gate passes it, so this is the source that normally answers in CI.
+    It is a non-secret repository or environment variable, never read from the PR.
+    """
+    if not isinstance(declared, str) or not declared.strip():
+        return None
+    return _days_until(declared, now)
+
+
 def token_warning(days):
     """The rotation alert for a day count, or None. Only the integer is ever shown."""
     if days is None or days > TOKEN_WARN_DAYS:
@@ -151,19 +168,29 @@ def token_warning(days):
 
 
 def report_token_expiry(envelope, now=None):
-    """Warn in the log and job summary. Never raises and never touches the verdict."""
+    """Warn in the log and job summary. Returns (days, source); never raises, never touches the verdict.
+
+    The CLI's own date wins when present; otherwise the declared date stands in.
+    """
     try:
-        days = token_days_left(envelope, time.time() if now is None else now)
+        now = time.time() if now is None else now
+        days, source = token_days_left(envelope, now), "cli"
+        if days is None:
+            days, source = fallback_days_left(os.environ.get(TOKEN_EXPIRY_ENV), now), "var"
+        if days is None:
+            return None, "none"
         message = token_warning(days)
         if message:
+            if source == "var":
+                message += f" (from {TOKEN_EXPIRY_ENV}; update it when you rotate)"
             print(f"::warning::{message}")
             summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if summary:
                 with open(summary, "a", encoding="utf-8") as handle:
                     handle.write(f"- {message}\n")
-        return days
+        return days, source
     except Exception:  # an alert must never fail the gate
-        return None
+        return None, "none"
 
 
 def block(tier, reasons, blocking=()):
@@ -362,10 +389,10 @@ def main():
             json.dump(clean, handle, indent=2)
         # The day count only, never the date: the log is public. It stays out of the
         # verdict, so the alert can't move the outcome or the tier.
-        days = report_token_expiry(envelope)
+        days, token_from = report_token_expiry(envelope)
         print(f'sanitized: cli_ok={clean["cli_ok"]} malformed={clean["malformed"]} '
               f'status={clean["error_status"]} usage={clean["usage"]} '
-              f'token_days={"unknown" if days is None else days}')
+              f'token_days={"unknown" if days is None else days} token_from={token_from}')
         return 0
 
     if not args.decide:
@@ -663,7 +690,36 @@ def selftest():
         check("the alert leaves the sanitized verdict unchanged",
               json.loads(saved) == sanitize(envelope(good), 0, diff, schema))
         check("an unreadable value never raises",
-              report_token_expiry({"credential_expires_at": object()}) is None)
+              report_token_expiry({"credential_expires_at": object()}) == (None, "none"))
+
+    # fallback: the CLI omits the date for an env token, so the declared date answers
+    saved_env = os.environ.get(TOKEN_EXPIRY_ENV)
+    try:
+        day = lambda d: datetime.fromtimestamp(now + d * 86400, timezone.utc).strftime("%Y-%m-%d")
+        check("fallback date-only parses as UTC midnight", fallback_days_left(day(10), now) in (9, 10))
+        check("fallback empty or unset: unknown", fallback_days_left("", now) is None and fallback_days_left(None, now) is None)
+        for bad in ["soon", "2026-13-45", "  "]:
+            check(f"fallback malformed {bad!r}: unknown", fallback_days_left(bad, now) is None)
+        quiet = io.StringIO()
+        with contextlib.redirect_stdout(quiet):
+            os.environ[TOKEN_EXPIRY_ENV] = iso(3)
+            got_var = report_token_expiry({"is_error": False}, now)
+            os.environ[TOKEN_EXPIRY_ENV] = iso(300)
+            got_cli = report_token_expiry({"credential_expires_at": iso(5)}, now)
+            os.environ[TOKEN_EXPIRY_ENV] = "garbage"
+            got_bad = report_token_expiry({"is_error": False}, now)
+            os.environ.pop(TOKEN_EXPIRY_ENV, None)
+            got_none = report_token_expiry({"is_error": False}, now)
+        logged = quiet.getvalue()
+        check("CLI date absent: the declared date warns at 3 days", got_var == (3, "var") and f"from {TOKEN_EXPIRY_ENV}" in logged)
+        check("CLI date present: it wins over the declared date", got_cli == (5, "cli"))
+        check("declared date malformed: unknown, no raise", got_bad == (None, "none"))
+        check("neither source: unknown", got_none == (None, "none"))
+    finally:
+        if saved_env is None:
+            os.environ.pop(TOKEN_EXPIRY_ENV, None)
+        else:
+            os.environ[TOKEN_EXPIRY_ENV] = saved_env
 
     # end to end through the CLI: a missing verdict must exit non-zero
     with tempfile.TemporaryDirectory() as tmp:

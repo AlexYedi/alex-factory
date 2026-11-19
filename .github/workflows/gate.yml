@@ -166,6 +166,9 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MODEL: ${{ inputs.model }}
+          # Non-secret expiry date (YYYY-MM-DD) set on factory-review at each rotation. The CLI
+          # omits credential_expires_at for an env token; env -i keeps this away from the CLI.
+          CLAUDE_TOKEN_EXPIRES_ON: ${{ vars.CLAUDE_TOKEN_EXPIRES_ON }}
         run: |
           # Empty cwd and HOME, so there is no CLAUDE.md, settings or MCP config to
           # find. env -i passes the token and nothing else from the runner. The
