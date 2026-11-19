@@ -1,0 +1,22 @@
+# alex-factory gates itself (YED-355 item 3). Unlike an adopter, it calls its own
+# gate with ./ and core_sha = the PR's base SHA. pull_request_target takes this
+# file and ./gate.yml from the base branch, so a PR can never edit the code that
+# judges it, and nothing needs a SHA bump after each merge.
+name: factory-gate
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [core-v0]
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: factory-gate-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+jobs:
+  factory-gate:
+    uses: ./.github/workflows/gate.yml
+    with:
+      core_sha: ${{ github.event.pull_request.base.sha }}
+      app_slug: alexyedi-factory
+    secrets: inherit

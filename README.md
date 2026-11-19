@@ -266,3 +266,12 @@ Everything below needs a live GitHub repository. None of it has been exercised y
   `token_days=N token_from=cli|var|none`; `none` means neither source answered, so no alert can fire.
   The date is not secret: it shows in the step's public `env:` block, so it is a plain variable.
   Only `YYYY-MM-DD` is read; anything else counts as unknown.
+
+## alex-factory gates itself
+
+Every file here decides merges for every adopting repo, so the policy is all T2: the gate reviews and tests each PR, and the owner approves it; the App never does. The callers in `.github/workflows/factory-gate.yml` and `factory-tests.yml` differ from an adopter's in two ways:
+- They call `./.github/workflows/*.yml`.
+- They pass `core_sha: base.sha`.
+
+`pull_request_target` takes the gate from the base branch, so a PR can't edit its own judge, and no pin needs bumping after a merge. The protected branch is `core-v0`, which is where adopters pin.
+
