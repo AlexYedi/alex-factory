@@ -6,8 +6,9 @@
 #   classify  none                                  (deterministic, public data only)
 #   review    CLAUDE_CODE_OAUTH_TOKEN               (model, no tools, no repo)
 #   decide    App id + key, FACTORY_NAME_BLOCKLIST  (deterministic, the only writer)
-# Both environments must restrict deployment branches to main: that is what stops
-# a same-repo PR reading these secrets from a workflow it adds itself.
+# Both environments must restrict deployment branches to the protected default
+# branch: that is what stops a same-repo PR reading these secrets from a
+# workflow it adds itself. Keep factory secrets out of repo-level secrets.
 #
 # Logs and artifacts are public, including every env: block and ${{ }} value. So
 # classify hands over only data that is already public, and decide works out the

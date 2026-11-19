@@ -649,8 +649,16 @@ def selftest():
           len(pins) == 1 and cli_pkgs.get("node_modules/@anthropic-ai/claude-code", {}).get("version") == pins[0])
     check("every locked CLI package carries a sha512 integrity",
           len(cli_pkgs) >= 2 and all(str(v.get("integrity", "")).startswith("sha512-") for v in cli_pkgs.values()))
-    check("the gate installs with npm ci from the core checkout, not npm install",
-          "npm ci --prefix" in gate_text and "claude-code@$CLAUDE_VERSION" not in gate_text)
+    check("the runner's platform binary (linux-x64) is locked with a sha512",
+          str(cli_pkgs.get("node_modules/@anthropic-ai/claude-code-linux-x64", {}).get("integrity", "")).startswith("sha512-"))
+    # read the review job's install step as code (comment lines dropped), not as a substring of the file
+    install = gate_text.split("- name: Install pinned Claude Code outside any repo", 1)[-1].split("- name:", 1)[0]
+    install_code = [ln.strip() for ln in install.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    check("the gate copies the lock from the core checkout and installs it with npm ci",
+          'lock="_factory/factory/cli/package-lock.json"' in install_code
+          and 'cp _factory/factory/cli/package.json "$lock" "$RUNNER_TEMP/cli/"' in install_code
+          and 'npm ci --prefix "$RUNNER_TEMP/cli" --no-audit --no-fund' in install_code
+          and not any("npm install" in ln or "claude-code@" in ln for ln in install_code))
 
     # YED-355: early warning before the OAuth token lapses
     now = 1_800_000_000

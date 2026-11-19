@@ -246,7 +246,8 @@ Everything below needs a live GitHub repository. None of it has been exercised y
   from the core checkout, so every tarball is checked against its sha512, and it fails closed if the
   `claude_version` input disagrees with the lock. To bump, in one T2 PR: change the version in
   `factory/cli/package.json` and the `claude_version` default in `gate.yml`, then run
-  `npm install --package-lock-only` in `factory/cli`. The self-test checks that they match.
+  `npm install --package-lock-only` in `factory/cli`. The self-test checks that they match. An adopter
+  that overrides `claude_version` without a matching core lock now fails closed.
 - **A decoy can satisfy the selftest ratchet.** Moving `--selftest` into a comment escalates,
   but moving it into an unused string does not.
 - **Selftest lists are compared by glob, not by content.** The gate has no tree, so any rename
