@@ -284,3 +284,5 @@ Requirements and limits:
 - **A PR can edit its own tests job.** `factory-tests` runs `pull_request` from the PR's own commit, so a green check on a PR that touches `tests.yml` or `factory-tests.yml` proves nothing. That's acceptable, because everything is T2 and the owner reads the diff.
 - **The owner is the only code owner and can't approve their own PRs,** so merges use the admin bypass. The ruleset limits that bypass to PRs (`bypass_mode: pull_request`), so nobody pushes straight to `core-v0`.
 - **Factory secrets live only in the two environments**, never at repo level.
+
+<!-- self-gate proof PR, close unmerged -->
