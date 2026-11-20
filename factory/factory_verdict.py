@@ -639,6 +639,27 @@ def selftest():
     caller = _load_text(os.path.join(os.path.dirname(DEFAULT_SCHEMA), "..", "templates", "workflows", "factory-gate.yml")) or ""
     check("REVIEW2 concurrency group includes the head SHA", "pull_request.head.sha }}" in caller.split("concurrency:")[1].split("jobs:")[0])
 
+    # YED-355 item 2: the CLI the gate runs is the one the lockfile pins, hash and all
+    root = os.path.join(os.path.dirname(DEFAULT_SCHEMA), "..")
+    gate_text = _load_text(os.path.join(root, ".github", "workflows", "gate.yml")) or ""
+    lock = _load_json(os.path.join(root, "factory", "cli", "package-lock.json")) or {}
+    pins = re.findall(r"claude_version:.*?default:\s*([0-9][0-9.]*)", gate_text, re.S)
+    cli_pkgs = {k: v for k, v in (lock.get("packages") or {}).items() if k.startswith("node_modules/@anthropic-ai/claude-code")}
+    check("gate.yml default claude_version matches the lockfile",
+          len(pins) == 1 and cli_pkgs.get("node_modules/@anthropic-ai/claude-code", {}).get("version") == pins[0])
+    check("every locked CLI package carries a sha512 integrity",
+          len(cli_pkgs) >= 2 and all(str(v.get("integrity", "")).startswith("sha512-") for v in cli_pkgs.values()))
+    check("the runner's platform binary (linux-x64) is locked with a sha512",
+          str(cli_pkgs.get("node_modules/@anthropic-ai/claude-code-linux-x64", {}).get("integrity", "")).startswith("sha512-"))
+    # read the review job's install step as code (comment lines dropped), not as a substring of the file
+    install = gate_text.split("- name: Install pinned Claude Code outside any repo", 1)[-1].split("- name:", 1)[0]
+    install_code = [ln.strip() for ln in install.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    check("the gate copies the lock from the core checkout and installs it with npm ci",
+          'lock="_factory/factory/cli/package-lock.json"' in install_code
+          and 'cp _factory/factory/cli/package.json "$lock" "$RUNNER_TEMP/cli/"' in install_code
+          and 'npm ci --prefix "$RUNNER_TEMP/cli" --no-audit --no-fund' in install_code
+          and not any("npm install" in ln or "claude-code@" in ln for ln in install_code))
+
     # YED-355: early warning before the OAuth token lapses
     now = 1_800_000_000
     iso = lambda d: datetime.fromtimestamp(now + d * 86400, timezone.utc).isoformat().replace("+00:00", "Z")

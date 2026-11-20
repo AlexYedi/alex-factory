@@ -6,8 +6,9 @@
 #   classify  none                                  (deterministic, public data only)
 #   review    CLAUDE_CODE_OAUTH_TOKEN               (model, no tools, no repo)
 #   decide    App id + key, FACTORY_NAME_BLOCKLIST  (deterministic, the only writer)
-# Both environments must restrict deployment branches to main: that is what stops
-# a same-repo PR reading these secrets from a workflow it adds itself.
+# Both environments must restrict deployment branches to the protected default
+# branch: that is what stops a same-repo PR reading these secrets from a
+# workflow it adds itself. Keep factory secrets out of repo-level secrets.
 #
 # Logs and artifacts are public, including every env: block and ${{ }} value. So
 # classify hands over only data that is already public, and decide works out the
@@ -159,9 +160,19 @@ jobs:
         env:
           CLAUDE_VERSION: ${{ inputs.claude_version }}
         run: |
+          # npm ci installs exactly what factory/cli/package-lock.json names, taken from
+          # the core checkout (never the PR), and checks every tarball against its
+          # sha512. A version pin alone trusts the registry; this doesn't (YED-355).
           set -euo pipefail
-          npm install --prefix "$RUNNER_TEMP/cli" --no-audit --no-fund \
-            "@anthropic-ai/claude-code@$CLAUDE_VERSION"
+          lock="_factory/factory/cli/package-lock.json"
+          locked="$(node -p "require('./$lock').packages['node_modules/@anthropic-ai/claude-code'].version")"
+          if [ "$locked" != "$CLAUDE_VERSION" ]; then
+            echo "::error::claude_version $CLAUDE_VERSION is not the locked CLI ($locked); bump both in one T2 PR"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/cli"
+          cp _factory/factory/cli/package.json "$lock" "$RUNNER_TEMP/cli/"
+          npm ci --prefix "$RUNNER_TEMP/cli" --no-audit --no-fund
       - name: Review the stripped diff
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
