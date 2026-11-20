@@ -271,3 +271,16 @@ Everything below needs a live GitHub repository. None of it has been exercised y
   `token_days=N token_from=cli|var|none`; `none` means neither source answered, so no alert can fire.
   The date is not secret: it shows in the step's public `env:` block, so it is a plain variable.
   Only `YYYY-MM-DD` is read; anything else counts as unknown.
+
+## alex-factory gates itself
+
+Every file here decides merges for every adopting repo, so the policy is all T2: the gate reviews and tests each PR, and the owner approves it. The App never approves here. The callers in `.github/workflows/factory-gate.yml` and `factory-tests.yml` differ from an adopter's in two ways:
+- They call `./.github/workflows/*.yml`.
+- They pass `core_sha: base.sha`.
+
+Requirements and limits:
+- **`core-v0` must be the default branch.** `pull_request_target` loads the workflow, `./gate.yml` and the environment branch rules from the default branch. On any other branch, the gate never runs and fails closed. Adopters pin by SHA, so changing the default branch doesn't affect them.
+- **A PR can't edit its own judge.** The gate loads from the default branch, and the scripts come from `base.sha`.
+- **A PR can edit its own tests job.** `factory-tests` runs `pull_request` from the PR's own commit, so a green check on a PR that touches `tests.yml` or `factory-tests.yml` proves nothing. That's acceptable, because everything is T2 and the owner reads the diff.
+- **The owner is the only code owner and can't approve their own PRs,** so merges use the admin bypass. The ruleset limits that bypass to PRs (`bypass_mode: pull_request`), so nobody pushes straight to `core-v0`.
+- **Factory secrets live only in the two environments**, never at repo level.

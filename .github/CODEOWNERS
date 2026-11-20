@@ -1,0 +1,3 @@
+# Every file in alex-factory decides merges for every repo that adopts it, so
+# everything is T2: the owner approves each change, and the gate never approves.
+*    @AlexYedi
