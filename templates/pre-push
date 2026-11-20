@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Local pre-push scan. Push is the publish point on a public repo.
+
+CI runs after a commit is already public, and a public commit is not cleanly
+reversible, so this has to run before push. It scans every outgoing commit, not
+just the tip: a secret added then removed still publishes.
+
+Install: copy to .git/hooks/pre-push and chmod +x.
+Private terms: one per line in .git/info/factory-private-names. That file lives
+inside .git so it can never be committed. Findings name the rule and file, never
+the matched text. Binary files can't be scanned, so they block until you have
+looked at them: FACTORY_ALLOW_BINARY=1 git push.
+"""
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+
+ZERO = "0" * 40
+FILE_RULES = [
+    ("env file", re.compile(r"(?:^|/)\.env(?:\.(?!example$|sample$|template$)[^/]+)?$")),
+    ("private key file", re.compile(r"(?:^|/)(?:id_rsa|id_ed25519|.*\.pem|.*\.key|.*\.p12)$")),
+    ("credentials file", re.compile(r"(?:^|/)(?:credentials\.json|service-account.*\.json|\.npmrc|\.pypirc)$")),
+]
+SECRET_RULES = [
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})\b")),
+    ("Anthropic key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}")),
+    ("OpenAI-style key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
+    ("Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{20,}")),
+    ("private key block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("assigned secret", re.compile(
+        r"""(?i)\b(?:api[_-]?key|secret|token|passw(?:or)?d)\b["']?\s*[:=]\s*["'][^"'\s]{16,}["']""")),
+]
+
+
+def normalise(text):
+    """Undo look-alikes and hidden characters, so they can't split a match."""
+    text = unicodedata.normalize("NFKC", text)
+    return "".join(c for c in text if unicodedata.category(c) != "Cf")
+
+
+def git(repo, *args):
+    result = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"git {args[0]} failed")
+    return result.stdout
+
+
+def outgoing(repo, local_sha, remote_sha):
+    """rev-list arguments for what this push would publish."""
+    if remote_sha != ZERO:
+        try:
+            git(repo, "cat-file", "-e", f"{remote_sha}^{{commit}}")
+            return [local_sha, f"^{remote_sha}"]
+        except RuntimeError:
+            pass
+    return [local_sha, "--not", "--remotes"]
+
+
+def private_terms(repo):
+    path = git(repo, "rev-parse", "--git-path", "info/factory-private-names").strip()
+    path = path if os.path.isabs(path) else os.path.join(repo, path)
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as handle:
+        return [normalise(t.strip()).casefold() for t in handle if t.strip() and not t.startswith("#")]
+
+
+def scan(repo, local_sha, remote_sha):
+    """Return a sorted list of (rule, location) findings."""
+    span = outgoing(repo, local_sha, remote_sha)
+    terms = private_terms(repo)
+    findings = set()
+
+    def check_text(text, where, name_rule):
+        text = normalise(text)
+        for rule, pattern in SECRET_RULES:
+            if pattern.search(text):
+                findings.add((rule, where))
+        if any(t in text.casefold() for t in terms):
+            findings.add((name_rule, where))
+
+    # git log peels a tag to its commit, so an annotated tag's message needs its own read.
+    sha = local_sha
+    while git(repo, "cat-file", "-t", sha).strip() == "tag":
+        body = git(repo, "cat-file", "tag", sha)
+        for line in body.split("\n"):
+            check_text(line, "(tag message)", "private name in tag message")
+        sha = body.split("\n", 1)[0].split()[1]
+
+    names = git(repo, "log", "-m", "--no-renames", "--name-only", "--diff-filter=d",
+                "--format=", "-z", *span)
+    for name in filter(None, names.replace("\n", "\0").split("\0")):
+        for rule, pattern in FILE_RULES:
+            if pattern.search(name):
+                findings.add((rule, name))
+        if any(t in normalise(name).casefold() for t in terms):
+            findings.add(("private name in path", name))
+    stats = git(repo, "log", "-m", "--no-renames", "--numstat", "--diff-filter=d", "--format=", "-z", *span)
+    for entry in filter(None, stats.replace("\n", "\0").split("\0")):
+        added, _, path = entry.partition("\t")
+        if added == "-" and not os.environ.get("FACTORY_ALLOW_BINARY"):
+            findings.add(("binary file, not scannable", path.split("\t", 1)[-1]))
+    current, in_hunk = "(unknown file)", False
+    patch = git(repo, "log", "-m", "--no-renames", "--no-color", "--no-ext-diff", "--no-textconv",
+                "-U0", "-p", "--format=", *span)
+    for line in patch.split("\n"):
+        # Header state, not a "+++ " prefix test: content starting "++ " shows up
+        # as "+++ " in a patch, and must be scanned as content.
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@ "):
+            in_hunk = True
+        elif not in_hunk and line.startswith("+++ b/"):
+            current = line[6:]
+        elif in_hunk and line.startswith("+"):
+            check_text(line, current, "private name in content")
+    for line in git(repo, "log", "--format=%B", *span).split("\n"):
+        check_text(line, "(commit message)", "private name in commit message")
+    return sorted(findings)
+
+
+def main():
+    if "--selftest" in sys.argv:
+        return selftest()
+    repo = os.getcwd()
+    found = []
+    try:
+        if not private_terms(repo):
+            print("pre-push: warning: no private names configured in "
+                  ".git/info/factory-private-names, so names are not being checked", file=sys.stderr)
+        for line in sys.stdin:
+            parts = line.split()
+            if len(parts) == 4 and parts[1] != ZERO:
+                found += scan(repo, parts[1], parts[3])
+    except RuntimeError as exc:
+        print(f"pre-push: scan could not run ({exc}); blocking push", file=sys.stderr)
+        return 1
+    if found:
+        print("pre-push: blocked, this push would publish:", file=sys.stderr)
+        for rule, where in sorted(set(found)):
+            print(f"  {rule}: {where}", file=sys.stderr)
+        print("Rewrite the commits that added it. Removing it in a new commit still publishes it.",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def selftest():
+    failed = 0
+
+    def check(name, ok):
+        nonlocal failed
+        failed += 0 if ok else 1
+        print("ok  " if ok else "FAIL", name)
+
+    # Built by concatenation so this file does not trip scanners itself.
+    aws = "AKIA" + "ABCDEFGHIJKLMNOP"
+    with tempfile.TemporaryDirectory() as repo:
+        def run(*args):
+            subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                            "-c", "commit.gpgsign=false", *args], check=True, capture_output=True)
+
+        def commit(path, text, message="change"):
+            full = os.path.join(repo, path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            run("add", "-A")
+            run("commit", "-m", message)
+            return git(repo, "rev-parse", "HEAD").strip()
+
+        run("init", "-q")
+        base = commit("README.md", "hello\n")
+        check("clean commit passes", scan(repo, commit("a.txt", "fine\n"), base) == [])
+        tip = commit("b.txt", f"key {aws}\n")
+        check("secret in content is caught", ("AWS access key", "b.txt") in scan(repo, tip, base))
+        tip = commit("b.txt", "removed\n")
+        check("HOSTILE secret added then removed is still caught", ("AWS access key", "b.txt") in scan(repo, tip, base))
+        base = tip
+        tip = commit(".env", "A=1\n")
+        check("env file name is caught", ("env file", ".env") in scan(repo, tip, base))
+        base = tip
+        check("env example is allowed", scan(repo, commit(".env.example", "A=\n"), base) == [])
+        base = git(repo, "rev-parse", "HEAD").strip()
+        check("key in commit message is caught", any(w == "(commit message)" for _, w in scan(repo, commit("c.txt", "x\n", f"oops {aws}"), base)))
+        base = git(repo, "rev-parse", "HEAD").strip()
+        with open(os.path.join(repo, ".git", "info", "factory-private-names"), "w", encoding="utf-8") as handle:
+            handle.write("# local list\nJane Example\n")
+        tip = commit("d.txt", "met jane example today\n")
+        found = scan(repo, tip, base)
+        check("private term in content is caught", ("private name in content", "d.txt") in found)
+        check("output never prints the private term", "jane" not in repr(found).lower())
+        base = tip
+        tip = commit("notes/jane example.txt", "x\n")
+        check("private term in a path is caught", ("private name in path", "notes/jane example.txt") in scan(repo, tip, base))
+        base = tip
+        with open(os.path.join(repo, "report.pdf"), "wb") as handle:
+            handle.write(b"%PDF-1.7\x00\xff\xfe " + aws.encode() + b"\x00")
+        run("add", "-A")
+        run("commit", "-m", "pdf")
+        tip = git(repo, "rev-parse", "HEAD").strip()
+        check("REVIEW PDF holding a key is flagged", ("binary file, not scannable", "report.pdf") in scan(repo, tip, base))
+        os.environ["FACTORY_ALLOW_BINARY"] = "1"
+        check("binary flag can be overridden on purpose", scan(repo, tip, base) == [])
+        del os.environ["FACTORY_ALLOW_BINARY"]
+        base = tip
+        tip = commit("e.txt", f"++ {aws}\n")
+        check("REVIEW `++ AKIA..` line is scanned as content", ("AWS access key", "e.txt") in scan(repo, tip, base))
+        base = tip
+        tip = commit("f.txt", "met Ja\u200bne Exam\u200dple today\n")
+        check("REVIEW name split by zero-width chars is caught", ("private name in content", "f.txt") in scan(repo, tip, base))
+        base = tip
+        tip = commit("g.txt", "key " + "\u200b".join(aws) + "\n")
+        check("key split by zero-width chars is caught", any(r == "AWS access key" for r, _ in scan(repo, tip, base)))
+
+        base = git(repo, "rev-parse", "HEAD").strip()
+        run("tag", "-a", "v1", "-m", f"release {aws}")
+        tag = git(repo, "rev-parse", "refs/tags/v1").strip()
+        check("REVIEW2 annotated tag message is scanned", ("AWS access key", "(tag message)") in scan(repo, tag, base))
+        run("tag", "-a", "v1-outer", "-m", "wrapper", tag)
+        outer = git(repo, "rev-parse", "refs/tags/v1-outer").strip()
+        check("nested tag is scanned too", ("AWS access key", "(tag message)") in scan(repo, outer, base))
+        run("tag", "-a", "v2", "-m", "met Ja\u200bne Example", base)
+        names_tag = git(repo, "rev-parse", "refs/tags/v2").strip()
+        check("private term in a tag message is caught", ("private name in tag message", "(tag message)") in scan(repo, names_tag, base))
+
+        def hook(sha):
+            line = f"refs/heads/x {sha} refs/heads/x {ZERO}\n"
+            return subprocess.run([sys.executable, os.path.abspath(__file__)], cwd=repo, input=line,
+                                  capture_output=True, text=True, check=False)
+        os.remove(os.path.join(repo, ".git", "info", "factory-private-names"))
+        run("checkout", "-q", "--orphan", "clean")
+        run("rm", "-rfq", ".")
+        clean_tip = commit("ok.txt", "fine\n")
+        result = hook(clean_tip)
+        check("REVIEW missing names file warns", "no private names configured" in result.stderr)
+        check("clean push still exits zero when warning", result.returncode == 0)
+        run("checkout", "-q", tip)
+        check("hook blocks and exits non-zero", hook(tip).returncode == 1)
+        check("new branch with no remote scans all commits", any(r == "AWS access key" for r, _ in scan(repo, tip, ZERO)))
+        try:
+            scan(repo, "f" * 40, ZERO)
+            check("unknown commit fails closed", False)
+        except RuntimeError:
+            check("unknown commit fails closed", True)
+    print(f"pre-push selftest: {'FAILED ' + str(failed) if failed else 'passed'}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

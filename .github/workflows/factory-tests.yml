@@ -1,0 +1,15 @@
+# Runs PR code (the factory's own self-tests), so it is assumed hostile: no
+# secrets are passed, and no `secrets: inherit`, ever. The policy it reads comes
+# from the base SHA, never the PR.
+name: factory-tests
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [core-v0]
+permissions:
+  contents: read
+jobs:
+  factory-tests:
+    uses: ./.github/workflows/tests.yml
+    with:
+      core_sha: ${{ github.event.pull_request.base.sha }}
