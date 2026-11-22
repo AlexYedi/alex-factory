@@ -243,7 +243,8 @@ jobs:
         continue-on-error: true
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ secrets.FACTORY_APP_ID }}
+          # The client ID is not a secret, so it is an environment variable (app-id is deprecated).
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
           private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
           # Only what decide uses, whatever else the App is granted.

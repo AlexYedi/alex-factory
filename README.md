@@ -94,7 +94,7 @@ done
 gh secret set FACTORY_NAME_BLOCKLIST --env factory-decide -R "$R" < blocklist.txt
 claude setup-token   # then paste the token below
 gh secret set CLAUDE_CODE_OAUTH_TOKEN --env factory-review -R "$R"
-gh secret set FACTORY_APP_ID --env factory-decide -R "$R" --body "APP_ID"
+gh variable set FACTORY_APP_CLIENT_ID --env factory-decide -R "$R" --body "CLIENT_ID"   # Iv..., App settings > General
 gh secret set FACTORY_APP_PRIVATE_KEY --env factory-decide -R "$R" < app-private-key.pem
 ```
 
