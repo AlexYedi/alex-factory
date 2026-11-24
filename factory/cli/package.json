@@ -1,0 +1,8 @@
+{
+  "name": "factory-claude-cli",
+  "private": true,
+  "description": "Pins the Claude Code CLI the gate runs. npm ci installs it from package-lock.json, so every tarball is checked against its sha512. Bump in a T2 PR: change the version here and in gate.yml claude_version, then npm install --package-lock-only.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.319"
+  }
+}
